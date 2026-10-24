@@ -10,7 +10,7 @@ Project conventions win over this document. When an instruction here conflicts w
 
 ## Branch roles
 
-The branch roles below describe the agreed target layout. Until that layout exists, only the explicitly approved bootstrap tasks below may use `main` as their base.
+The branch roles below describe the agreed layout. The repository section records its initialization; historical bootstrap exceptions do not authorize new work from `main`.
 
 `master` mirrors upstream. It carries only commits that exist upstream. Touch it when the user asks to check or sync upstream, and update it by fast-forward. If upstream history diverged or was rewritten, stop and report; resetting and force-pushing are not recovery steps.
 
@@ -22,7 +22,9 @@ Release tags are immutable. Each tag pins the commit that was actually built and
 
 ## Choosing the target version
 
-Read the issue body and its milestone first. When exactly one release line is clearly active, use it and say so in the handoff. When two lines are plausible, or none is, ask before branching.
+Read the issue body and its milestone first. When exactly one release line is clearly active, use it and say so in the handoff. When two lines are plausible, or none is, ask before branching; never default to `main`.
+
+Ordinary development starts from the verified current commit of the target release, on a `feature`, `fix`, `docs`, or `sync` task branch. Open its PR back to that release, not the default branch. The task branch is the delivery head; do not commit or push the task directly onto the release. Record the full base SHA. If the release has advanced since initialization, use its verified current baseline and keep the historical initialization SHA as evidence, not as a rollback target.
 
 A new release line starts from the exact tag of the previous released version. It never starts from an old release branch tip (that tip may hold unreleased work), from a stable aggregation commit, or from an arbitrary master commit.
 
@@ -32,7 +34,7 @@ An upstream update that should reach our own versions is its own task: branch `s
 
 Every change to tracked files binds to an existing or a new issue, and the agent may create or reuse the issue from a chat request.
 
-Discussion-only work, an investigation, or a comment added to a ticket produces no branch and no empty commit. A document or a research report that enters the repository is a file change, so it does get a branch.
+Discussion-only work, an investigation, a comment added to a ticket, or a pure Git-reference operation produces no empty commit. Discussion and ticket-only work need no task branch; a pure reference operation changes only its authorized refs. A document or a research report that enters the repository is a file change, so it does get a task branch.
 
 One branch covers one independently deliverable task. Branches follow tasks, not chat sessions or subagents: a new session continues the existing branch, and unrelated tasks stay apart.
 
@@ -48,6 +50,14 @@ Names are `feature/<short>`, `fix/<short>`, `docs/<short>`, or `sync/<short>`. S
 Done when you can name the issue, the base commit, and every pre-existing dirty path you are leaving untouched.
 
 Pre-existing changes stay where they are. Never stash away, restore, or clean another party's work, and never let it ride along in a commit. Stage explicit paths rather than `git add -A`. An isolated index or a throwaway checkout keeps the working tree clean, and it still holds only the task's files. When ownership is unclear, ask.
+
+## Upstream contributions
+
+A contribution to the official repository is separate from ordinary release development and mirror maintenance. Verify the official target repository and branch, record its full commit SHA, and start an independent task branch at that SHA. Select only the agreed feature and its necessary tests and documentation. Never offer the entire personal `main` or release history as the contribution.
+
+Use the existing task prefixes, for example `feature/upstream-codex-subscription`. The historical `contrib/instance-codex-subscription` candidate does not establish another naming convention or prove compatibility with the current official target. Inspect reusable candidates and rerun applicable checks; old logs are not current acceptance evidence.
+
+Preparing and pushing the authorized task branch to `origin` is not permission to create or reopen an official PR. Obtain separate approval for those external actions. The contribution's PR target, if approved, is the verified official branch, not our release line.
 
 ## Commits
 
@@ -96,7 +106,9 @@ Report which lines a fix applies to and wait for confirmation. Then port it per 
 
 ## Worktrees
 
-Each worktree needs its own approval. Parallel work is no reason to skip that gate. An approved copy stays narrow: only the dependencies and fixtures that copy needs, because repeated installs and build output are what fill the disk. A dirty worktree is never force-deleted.
+Check existing environments for safe reuse first. Each new worktree needs its own approval; parallel work is no reason to skip that gate. Before adding source or dependency copies, separate installs, caches, or build trees, report the reason, absolute destination, estimated disk growth, and retention plan, then obtain approval. An approved copy stays narrow: only the dependencies and fixtures that copy needs. A dirty worktree is never force-deleted.
+
+Inspect test scripts and tool behavior before running them. If a check implicitly installs dependencies, builds, or creates another environment, stop for the same approval; naming it a test does not exempt it. Reuse the applicable skills rather than inventing another review or test procedure.
 
 ## Test environment and deployment
 
@@ -106,20 +118,38 @@ CI configuration, deployment targets, release channels, and branch protection mo
 
 ## This repository
 
-- `origin` is `https://github.com/gzy31007/learnharness.git`.
-- `upstream` is `https://github.com/amosblomqvist/learnharness.git`, the mirror source for `master`. On 2026-10-23 this clone lists only `origin` under `git remote -v` (stale `refs/remotes/upstream/*` exist). Add the upstream remote before a mirror fetch rather than guessing from those refs.
-- `main` is at `c9b033e6b1379c6424220102a34b15fdeaf6685e` (2026-10-23). `master`, `stable`, and `release/*` do not exist yet.
+- `origin` is `https://github.com/gzy31007/learnharness.git`, the publishing destination for our branches, including the `master` mirror.
+- The official mirror source is the `main` branch of `https://github.com/amosblomqvist/learnharness.git`. It is read-only for mirror work; `origin/master` is the published copy, not the official source.
+- `release/0.3` is the established development and acceptance entry for our 0.3.x tasks. Verify its current SHA for each task; do not infer it from a local `main` checkout.
+- `main` and the default branch are retained. Initialization did not create `stable` or formal release tags, or migrate CI, deployment, release channels, or branch protection.
 - Issues live in GitHub Issues for `gzy31007/learnharness`; operations are in [issue-tracker.md](issue-tracker.md).
 
+### Mirror source and tracking
+
+Inspect actual remote URLs, push URLs, branch tracking, and destination refs before mirror work. If an `upstream` remote is needed, verify any existing remote with that name before configuring it; stop on a conflicting source instead of overwriting it. Stale remote-tracking refs do not prove that a remote is configured. Reading the official URL directly is also possible without introducing defaults.
+
+Keep official reads and `origin` publication explicit. Local `master`, `origin/master`, and a branch's configured tracking target are different things. A remote-tracking ref records a fetched observation; its presence neither configures `git pull` nor chooses a push destination. Initialization adds no default pull or push behavior. Do not add tracking or change defaults merely because the mirror now exists.
+
+A later, authorized mirror update may only fast-forward to a verified official commit. Stop on divergence, an upstream rewrite, a conflicting source, or an unexpected concurrent ref change. Do not reset, force-push, delete and recreate a branch, or bypass approval to make the mirror match. Before publishing, check the target commit's workflows and relevant integrations; stop if an unauthorized release or deployment cannot be excluded. Updating the mirror is not permission to merge upstream into any release.
+
+### First initialization exception, 2026-10-24
+
+The user approved the fixed targets and the one-time absence of a previous formal release tag in [specification #31](https://github.com/gzy31007/learnharness/issues/31). [Initialization #32](https://github.com/gzy31007/learnharness/issues/32) records verification and the user's acceptance on 2026-10-24. The initial local and `origin` targets were:
+
+- `release/0.3`: `c7f1e14e9aafbe3be2d68401f20466713ae4895f`, the approved committed `origin/main` snapshot.
+- `master`: `6cba9c8c5afe8a63f47ea4ebae6e91d8a205cebb`, the approved official `main` commit with its ancestry.
+
+These are historical initialization targets, not permanent branch tips. The first release line is a development snapshot, not a formal release, a tag, or completed upstream integration. This exception applies only to the first initialization. Future release lines still start from the exact previous formal release tag under the generic rules above.
+
+The original upstream impact investigation and any actual `sync` remain separate follow-up work. Old security approval gates and locked archives remain protected; this initialization does not authorize product changes, global guidance edits, or artifact cleanup.
+
+### Historical documentation bootstrap, 2026-10-23
+
+Before a release line existed, the user authorized `docs/git-workflow` and `docs/workspace-cleanup` to branch from `main` and PR back to `main`, for documents, an index, and ignore rules. That approval covered only those two tasks; it does not extend to later work. New ordinary tasks now use the target release and a separate task head.
+
+Moving the trunk, changing CI or release settings, editing the global `AGENTS.md`, deleting old artifacts, and retroactively adopting uncommitted history each need their own decision. Migrating these generic rules into global guidance is a later, out-of-scope step.
+
 The three-to-four-commit stable count is our own convention for this project, not an upstream rule.
-
-## Bootstrap exception, 2026-10-23
-
-The user authorized two documentation tasks to branch from `main` and PR back to `main` while no release line exists: `docs/git-workflow` and `docs/workspace-cleanup`, for documents, an index, and ignore rules.
-
-That approval covers those two branches only. Moving the trunk, changing CI or release settings, editing the global `AGENTS.md`, deleting old artifacts, and retroactively adopting uncommitted history each need their own decision. Once a release line exists, new work targets it; this exception is not a standing bypass of the release baseline.
-
-Migrating the generic rules into the global `AGENTS.md` is a later step and is out of scope here.
 
 ## Portability
 
