@@ -20,6 +20,6 @@ Workspace files use English, including identifiers, comments, and development do
 
 Before repository changes, branch or PR operations, resuming a task, or handing work over, read [the Git workflow](docs/agents/git-workflow.md) and [the issue tracker instructions](docs/agents/issue-tracker.md). This includes changes to documentation and research notes.
 
-- Bind repository changes to an Issue and an independent task branch. Preserve existing changes; obtain approval before creating a worktree.
+- Bind file changes to an Issue and an independent task branch. For ordinary development, branch from the target release and PR back to it. Ask if the target is unclear; do not default to `main`. Preserve existing changes; obtain approval before creating a worktree.
 - Commit meaningful stages with what changed and why. Push before delivery or handoff and report the branch, commits, PR, and actual check results.
-- Keep merge, release, issue-closure, and upstream-PR decisions with the human. Use the workflow's explicit initialization exception while the version branches do not yet exist.
+- Keep merge, release, issue-closure, and upstream-PR decisions with the human. The workflow records the completed first initialization and the separate entry points for mirror maintenance and upstream contributions.
