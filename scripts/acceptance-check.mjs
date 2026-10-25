@@ -167,8 +167,10 @@ async function main() {
 		record.stage = "npm-config";
 		record.npmProbe = probeNpmConfigLoading({ env: created.env, cwd: record.cwd });
 
-		// A signal delivered while the synchronous probe ran is handled only
-		// after it returns; do not start the command for an interrupted run.
+		// The probe is synchronous, so a signal delivered during it is only
+		// dispatched once the loop resumes. Yield once before deciding to
+		// start the command, so an interrupted run never spawns the target.
+		await new Promise((resolve) => setImmediate(resolve));
 		if (interrupted) throw new RunnerFailure("interrupted", "interrupted by signal");
 
 		record.stage = "command";

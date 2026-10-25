@@ -143,12 +143,7 @@ export function createAcceptanceEnv({ mode, home, inheritedEnv = {} } = {}) {
 		NPM_CONFIG_USERCONFIG: userConfig,
 		NPM_CONFIG_GLOBALCONFIG: globalConfig,
 		NPM_CONFIG_CACHE: npmCache,
-		NPM_CONFIG_OFFLINE: "true",
-		NPM_CONFIG_AUDIT: "false",
-		NPM_CONFIG_FUND: "false",
-		NPM_CONFIG_UPDATE_NOTIFIER: "false",
-		NEXT_TELEMETRY_DISABLED: "1",
-		DO_NOT_TRACK: "1",
+		...POLICY_ENV_VALUES,
 		// NODE_ENV is part of the mode contract, never inherited: suite runs
 		// exactly like `npm test`, smoke runs the packaged shell in production.
 		NODE_ENV: mode === "suite" ? "test" : "production",

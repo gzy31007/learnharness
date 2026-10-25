@@ -791,6 +791,44 @@ describe("acceptance-check.mjs", () => {
 		}
 	});
 
+	it("does not start the command for a signal that arrives during the npm probe", async () => {
+		const root = scratch("cli-signal-during-probe");
+		try {
+			const bin = path.join(root, "bin");
+			fs.mkdirSync(bin);
+			const ready = path.join(root, "npm-ready.txt");
+			// Stand-in npm: announce itself, sleep long enough for SIGTERM to
+			// land inside spawnSync, then answer correctly.
+			fs.writeFileSync(
+				path.join(bin, "npm"),
+				`#!/bin/sh\n: > '${ready}'\n/bin/sleep 0.8\ncase "$3" in userconfig) printf '%s\\n' "$NPM_CONFIG_USERCONFIG" ;; globalconfig) printf '%s\\n' "$NPM_CONFIG_GLOBALCONFIG" ;; *) exit 9 ;; esac\n`,
+				{ mode: 0o700 },
+			);
+			const marker = path.join(root, "target-ran.txt");
+			const fake = fakeCommand(root, "must-not-run.sh", `printf 'ran' > "$1"`);
+			const output = path.join(root, "evidence");
+			const runner = spawn(process.execPath, [CLI, "--mode", "suite", "--output", output, "--", fake, marker], {
+				cwd: process.cwd(),
+				env: cliEnv({ PATH: bin }),
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+			const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+				runner.once("close", (code, signal) => resolve({ code, signal }));
+			});
+			await waitFor(() => fs.existsSync(ready));
+			runner.kill("SIGTERM");
+			await closed;
+
+			const record = readRecord(output);
+			assert.equal(record.success, false);
+			assert.equal(record.failureCategory, "interrupted");
+			assert.equal(record.targetStarted, false, "the command must not start when SIGTERM lands during the probe");
+			assert.equal(fs.existsSync(marker), false, "the command must not have run during the probe");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("records an empty command as spawn, not a preflight rejection", () => {
 		const root = scratch("cli-empty-command");
 		try {
@@ -824,17 +862,17 @@ describe("acceptance-check.mjs", () => {
 	});
 });
 
-describe("acceptance-check.mjs: output, deadline, and signals", () => {
-	const sleep = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const sleep = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
-	async function waitFor(predicate: () => boolean, timeoutMs = 20_000): Promise<void> {
-		const started = Date.now();
-		while (!predicate()) {
-			if (Date.now() - started > timeoutMs) assert.fail("timed out waiting for the command to start");
-			await new Promise((resolve) => setTimeout(resolve, 50));
-		}
+async function waitFor(predicate: () => boolean, timeoutMs = 20_000): Promise<void> {
+	const started = Date.now();
+	while (!predicate()) {
+		if (Date.now() - started > timeoutMs) assert.fail("timed out waiting for the command to start");
+		await new Promise((resolve) => setTimeout(resolve, 50));
 	}
+}
 
+describe("acceptance-check.mjs: output, deadline, and signals", () => {
 	function expectGone(pid: number): void {
 		assert.throws(() => process.kill(pid, 0), /ESRCH/, `process ${pid} must not survive the run`);
 	}
