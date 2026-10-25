@@ -20,7 +20,16 @@ async function waitFor(wc, expression) {
 	while (Date.now() < deadline) { if (await wc.executeJavaScript(expression)) return; await delay(100); }
 	throw new Error(`DOM wait timed out: ${expression}`);
 }
-async function shot(win, name) { fs.writeFileSync(path.join(root, name), (await win.webContents.capturePage()).toPNG()); }
+async function shot(win, name) {
+	// DOM existence can precede painted modal frames. Wait for finite entrance animations.
+	await win.webContents.executeJavaScript(`(async()=>{
+		const frame=()=>new Promise(resolve=>requestAnimationFrame(resolve));
+		await frame(); await frame();
+		await Promise.all(document.getAnimations().filter(animation=>animation.effect?.getTiming().iterations!==Infinity).map(animation=>animation.finished.catch(()=>{})));
+		await frame(); await frame();
+	})()`);
+	fs.writeFileSync(path.join(root, name), (await win.webContents.capturePage()).toPNG());
+}
 function finish(error) {
 	clearTimeout(deadline);
 	if (error) evidence.error = error.stack || String(error);
@@ -61,6 +70,7 @@ async function inspect(win) {
 	evidence.observations.settings = await wc.executeJavaScript(`document.querySelector('[data-testid="settings-dialog"]').innerText`);
 	check("three subscription connection rows", await wc.executeJavaScript(`["chatgpt","github-copilot","xai"].every(id=>document.querySelector('[data-testid="'+id+'-connection"]'))`));
 	check("no retired web OAuth entry in rendered settings", !/WebOAuth|web.oauth|\/api\/subscription|\/subscription\/attempts/i.test(evidence.observations.settings));
+	await waitFor(wc, `!!document.querySelector('[data-testid="group-provider-keys"]')`);
 	await shot(win, "02-settings.png");
 	// Open privacy notices only. Never press a sign-in/proceed control or use real accounts.
 	await wc.executeJavaScript(`document.querySelector('[data-testid="chatgpt-login"]').click()`);
