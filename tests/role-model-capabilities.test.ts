@@ -15,13 +15,14 @@
  *
  *  RUN    — child processes (one scenario per process: module singletons,
  *           the stale-sweep throttle, and the settings record are one-per-
- *           process facts) enter through `recoverStaleJobs()` and
- *           `handleChatRequest()` with the REAL chat-handler composition:
- *           its module-level `jobRunner`, `setJobRespawn`/`setTurnRunner`
- *           wiring, the settings-resolved role engine seam, the job runner's
- *           refusal convention, and the delivery/wake bookkeeping. Only the
- *           network is replaced (a fetch stub that records and answers —
- *           never a real request) and only the wake turn runner is inert.
+ *           process facts) enter through `recoverStaleJobs()` with the REAL
+ *           chat-handler composition: its module-level `jobRunner`,
+ *           `setJobRespawn`/`setTurnRunner` wiring, the settings-resolved
+ *           role engine seam, and the job runner's refusal convention. Only
+ *           the network is replaced (a stub that records and refuses —
+ *           never a real request). The models are ordinary api-key catalog
+ *           models: `openrouter/z-ai/glm-5.3-flash` accepts images, and
+ *           `openrouter/deepseek/deepseek-chat` is text-only.
  *
  * Isolation (parent AND children): fresh HOME / TMPDIR / XDG_CACHE_HOME /
  * LH_DATA_DIR / LH_AUTH_FILE, an explicit env allowlist for children (no
@@ -36,7 +37,6 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
-import { gunzipSync, zstdDecompressSync } from "node:zlib";
 import { after, describe, it } from "node:test";
 
 const CHILD_MODE = process.env.LH_ROLE_CAPABILITY_MODE ?? "";
@@ -103,10 +103,11 @@ const { readSettings, writeSettings } = await import("../src/store/settings.ts")
 const { SETTINGS_FILE } = await import("../config.ts");
 const { BACKGROUND_MODEL_ROLES } = await import("../src/core/settings.ts");
 
-const LUNA = { provider: "openai-codex", id: "gpt-6-luna" };
-const SPARK = { provider: "openai-codex", id: "gpt-5.3-codex-spark" };
-const IMAGE_API_KEY = { provider: "openrouter", id: "z-ai/glm-5.3-flash" };
-const TEXT_API_KEY = { provider: "zai", id: "glm-4.7" };
+// pi's shipped catalog is the authority: glm-5.3-flash accepts image input,
+// deepseek/deepseek-chat is text-only. Both are ordinary api-key models, so
+// the gate is exercised without any subscription/OAuth surface.
+const IMAGE_MODEL = { provider: "openrouter", id: "z-ai/glm-5.3-flash" };
+const TEXT_MODEL = { provider: "openrouter", id: "deepseek/deepseek-chat" };
 
 async function putSection(section: string, body: unknown): Promise<Response> {
 	return PUT(
@@ -125,12 +126,12 @@ function rawRecord(): string {
 
 describe("the agent-section write gate (real route + real settings store)", () => {
 	it("rejects a text-only visualMaker override with 400 and never persists it", async () => {
-		writeSettings({ version: 1, general: { autoUpdate: false }, models: { strong: { model: LUNA } } });
+		writeSettings({ version: 1, general: { autoUpdate: false }, models: { strong: { model: IMAGE_MODEL } } });
 		const before = rawRecord();
-		const res = await putSection("agent", { models: { visualMaker: { model: SPARK } }, tools: { demo: false } });
+		const res = await putSection("agent", { models: { visualMaker: { model: TEXT_MODEL } }, tools: { demo: false } });
 		assert.equal(res.status, 400);
 		const body = (await res.json()) as { error?: string };
-		assert.match(body.error ?? "", /gpt-5\.3-codex-spark/);
+		assert.match(body.error ?? "", /deepseek\/deepseek-chat/);
 		assert.match(body.error ?? "", /text only/);
 		assert.match(body.error ?? "", /image-capable/);
 		assert.equal(rawRecord(), before, "the refused write must not touch settings.json");
@@ -138,29 +139,29 @@ describe("the agent-section write gate (real route + real settings store)", () =
 	});
 
 	it("accepts an image-capable visualMaker override and persists it (other sections untouched)", async () => {
-		writeSettings({ version: 1, general: { autoUpdate: false }, models: { strong: { model: LUNA } } });
-		const res = await putSection("agent", { models: { visualMaker: { model: IMAGE_API_KEY } } });
+		writeSettings({ version: 1, general: { autoUpdate: false }, models: { strong: { model: IMAGE_MODEL } } });
+		const res = await putSection("agent", { models: { visualMaker: { model: IMAGE_MODEL } } });
 		assert.equal(res.status, 200);
 		const record = readSettings();
-		assert.deepEqual(record?.agent?.models?.visualMaker?.model, IMAGE_API_KEY);
+		assert.deepEqual(record?.agent?.models?.visualMaker?.model, IMAGE_MODEL);
 		// Replace-one-section discipline: the models + general sections survive.
-		assert.deepEqual(record?.models?.strong?.model, LUNA);
+		assert.deepEqual(record?.models?.strong?.model, IMAGE_MODEL);
 		assert.equal(record?.general?.autoUpdate, false);
 	});
 
 	it("keeps text-only models valid for NON-image background roles (structural, no global ban)", async () => {
-		writeSettings({ version: 1, models: { strong: { model: LUNA } } });
-		const res = await putSection("agent", { models: { researcher: { model: SPARK }, extractor: { model: SPARK } } });
+		writeSettings({ version: 1, models: { strong: { model: IMAGE_MODEL } } });
+		const res = await putSection("agent", { models: { researcher: { model: TEXT_MODEL }, extractor: { model: TEXT_MODEL } } });
 		assert.equal(res.status, 200);
 		const record = readSettings();
-		assert.deepEqual(record?.agent?.models?.researcher?.model, SPARK);
-		assert.deepEqual(record?.agent?.models?.extractor?.model, SPARK);
+		assert.deepEqual(record?.agent?.models?.researcher?.model, TEXT_MODEL);
+		assert.deepEqual(record?.agent?.models?.extractor?.model, TEXT_MODEL);
 	});
 
 	it("the original schema still rejects pdfReader (not a writable background role)", async () => {
-		writeSettings({ version: 1, models: { strong: { model: LUNA } } });
+		writeSettings({ version: 1, models: { strong: { model: IMAGE_MODEL } } });
 		const before = rawRecord();
-		const res = await putSection("agent", { models: { pdfReader: { model: IMAGE_API_KEY } } });
+		const res = await putSection("agent", { models: { pdfReader: { model: IMAGE_MODEL } } });
 		assert.equal(res.status, 400);
 		const body = (await res.json()) as { error?: string };
 		assert.match(body.error ?? "", /unknown role "pdfReader"/);
@@ -169,20 +170,19 @@ describe("the agent-section write gate (real route + real settings store)", () =
 	});
 
 	it("control: the vision slot still refuses a text-only model", async () => {
-		writeSettings({ version: 1, models: { strong: { model: LUNA } } });
-		const res = await putSection("models", { vision: { model: SPARK } });
+		writeSettings({ version: 1, models: { strong: { model: IMAGE_MODEL } } });
+		const res = await putSection("models", { vision: { model: TEXT_MODEL } });
 		assert.equal(res.status, 400);
 		const body = (await res.json()) as { error?: string };
 		assert.match(body.error ?? "", /vision slot needs an image-capable model/);
 	});
 });
 
-// ── child scenarios: the REAL composition (recovery + dispatch) ─────────────
+// ── child scenarios: the REAL composition (recovery) ────────────────────────
 
 interface FetchCall {
 	url: string;
 	method: string;
-	role: "prober" | "visualMaker" | "pdfReader" | "unexpected";
 }
 
 interface JobEvidence {
@@ -191,20 +191,13 @@ interface JobEvidence {
 	status: string;
 	error: string | null;
 	activity: string | null;
-	subscriptionGeneration: string | null;
 	result: unknown;
 }
 
 interface Evidence {
 	mode: string;
-	endpoint: string;
 	fetches: FetchCall[];
-	roles: Record<string, number>;
 	jobs: JobEvidence[];
-	generation?: string;
-	ackStatus?: number;
-	ackBody?: string;
-	turnBody?: string;
 }
 
 interface ChildResult {
@@ -239,6 +232,8 @@ function runScenario(mode: string): Promise<ChildResult> {
 			NEXT_TELEMETRY_DISABLED: "1",
 			NO_PROXY: "localhost,127.0.0.1,::1",
 			LH_ROLE_CAPABILITY_MODE: mode,
+			// Electron's executable needs Node mode in these allowlisted child environments.
+			...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: "1" } : {}),
 			// Carries the external network guard when the evidence runner sets it.
 			...(process.env.NODE_OPTIONS ? { NODE_OPTIONS: process.env.NODE_OPTIONS } : {}),
 		},
@@ -294,19 +289,18 @@ describe("recovery: a pre-existing text-only image role is refused, not executed
 	});
 });
 
-describe("dispatch: a real turn emitting `visual` lands on the same refusal", () => {
-	it("the prober runs, the visual job is refused before its model call", { timeout: 60_000 }, async () => {
-		const evidence = await scenario("dispatch-visual");
-		assert.equal(evidence.ackStatus, 200, `chat request refused: ${evidence.ackBody}`);
-		assert.ok(evidence.turnBody, "the prober turn produced no stream body");
-		assert.equal(evidence.roles.prober, 2, `expected two prober model steps: ${JSON.stringify(evidence.fetches)}`);
-		assert.equal(evidence.roles.visualMaker ?? 0, 0, "the refused visual role made a model request");
-		assert.equal(evidence.fetches.filter((call) => call.role === "unexpected").length, 0);
+describe("recovery: a retired background model is refused without an unhandled rejection", () => {
+	it("keeps a valid conversation model while settling a job pinned through the retired cheap slot", { timeout: 60_000 }, async () => {
+		const evidence = await scenario("recover-retired-cheap");
+		assert.deepEqual(evidence.fetches, [], "the retired role must not send ANY model request");
 		const job = evidence.jobs[0]!;
-		assert.equal(job.kind, "visual");
-		assert.equal(job.status, "error", `dispatched job did not converge: ${JSON.stringify(job)}`);
-		assert.match(job.error ?? "", /missing: vision/);
-		assert.equal(job.subscriptionGeneration, evidence.generation, "the dispatched job kept its provenance");
+		assert.equal(job.kind, "demo");
+		assert.equal(job.status, "error", `job did not settle: ${JSON.stringify(job)}`);
+		assert.match(job.error ?? "", /retired Codex connection/);
+		assert.match(job.error ?? "", /Select a model again/);
+		const result = job.result as { html?: string; notes?: string };
+		assert.equal(result.html, "");
+		assert.match(result.notes ?? "", /Select a model again/);
 	});
 });
 
@@ -316,115 +310,33 @@ async function runChildScenario(mode: string): Promise<void> {
 	assert.ok(process.env.LH_DATA_DIR && process.env.LH_AUTH_FILE, "isolation paths are required");
 	assert.equal(process.env.NODE_ENV, "test");
 
-	const CODEX_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses";
-	const VISUAL_MARKER = "You are a visual maker";
-	const PDF_MARKER = "You are a PDF reading specialist";
-	const CODEX = { provider: "openai-codex", id: "gpt-6-luna" };
-	const SPARK = { provider: "openai-codex", id: "gpt-5.3-codex-spark" };
+	const IMAGE_MODEL = { provider: "openrouter", id: "z-ai/glm-5.3-flash" };
+	const TEXT_MODEL = { provider: "openrouter", id: "deepseek/deepseek-chat" };
 
 	const print = (value: unknown) => console.log(`EVIDENCE ${JSON.stringify(value)}`);
 
-	// ── transport stub: records every call, answers synthetically (never real)
-	const jwt = (account: string) =>
-		`e30.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: account } })).toString("base64url")}.signature`;
-	const grant = (account: string) => ({
-		type: "oauth" as const,
-		access: jwt(account),
-		refresh: `refresh-${account}`,
-		expires: Date.now() + 3600_000,
-		accountId: account,
-	});
-	const sse = (payloads: unknown[]) =>
-		new Response(`${payloads.map((p) => `data: ${JSON.stringify(p)}\n\n`).join("")}data: [DONE]\n\n`, {
-			headers: { "content-type": "text/event-stream" },
-		});
-	const usage = { input_tokens: 11, output_tokens: 5, total_tokens: 16, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } };
-	const textResponse = (responseId: string, messageId: string, text: string) => {
-		const item = { id: messageId, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text }] };
-		return sse([
-			{ type: "response.created", response: { id: responseId, status: "in_progress", output: [] } },
-			{ type: "response.output_item.added", output_index: 0, item: { ...item, status: "in_progress", content: [] } },
-			{ type: "response.output_text.delta", output_index: 0, item_id: messageId, content_index: 0, delta: text },
-			{ type: "response.output_item.done", output_index: 0, item },
-			{ type: "response.completed", response: { id: responseId, status: "completed", output: [item], usage } },
-		]);
-	};
-	const callResponse = (name: string, argumentsText: string) => {
-		const callId = `call-${name}`;
-		const responseId = `resp-${name}`;
-		const call = { id: `fc-${callId}`, type: "function_call", status: "completed", call_id: callId, name, arguments: argumentsText };
-		return sse([
-			{ type: "response.created", response: { id: responseId, status: "in_progress", output: [] } },
-			{ type: "response.output_item.added", output_index: 0, item: { ...call, status: "in_progress", arguments: "" } },
-			{ type: "response.function_call_arguments.delta", output_index: 0, item_id: `fc-${callId}`, delta: argumentsText },
-			{ type: "response.function_call_arguments.done", output_index: 0, item_id: `fc-${callId}`, arguments: argumentsText },
-			{ type: "response.output_item.done", output_index: 0, item: call },
-			{ type: "response.completed", response: { id: responseId, status: "completed", output: [call], usage } },
-		]);
-	};
-	const bodyOf = async (init: RequestInit | undefined): Promise<string> => {
-		const headers = new Headers(init?.headers);
-		const bytes = Buffer.from(await new Response(init?.body).arrayBuffer());
-		const encoding = headers.get("content-encoding");
-		if (encoding === "gzip") return gunzipSync(bytes).toString("utf8");
-		if (encoding === "zstd") return zstdDecompressSync(bytes).toString("utf8");
-		return bytes.toString("utf8");
-	};
-
+	// ── network guard: ANY request is an unexpected fetch (zero is expected)
 	const fetches: FetchCall[] = [];
-	const roles: Record<string, number> = { prober: 0, visualMaker: 0, pdfReader: 0 };
-	let proberCalls = 0;
 	globalThis.fetch = async (input, init) => {
 		const url = String(input);
 		const method = init?.method ?? "GET";
-		if (url !== CODEX_ENDPOINT) {
-			fetches.push({ url, method, role: "unexpected" });
-			throw new Error(`unexpected fetch ${method} ${url}`);
-		}
-		const body = await bodyOf(init);
-		const role: FetchCall["role"] = body.includes(VISUAL_MARKER)
-			? "visualMaker"
-			: body.includes(PDF_MARKER)
-				? "pdfReader"
-				: "prober";
-		fetches.push({ url, method, role });
-		roles[role] = (roles[role] ?? 0) + 1;
-		if (role === "prober") {
-			proberCalls += 1;
-			// Step 1 dispatches a visual job; step 2 finishes the turn.
-			return proberCalls === 1
-				? callResponse("visual", JSON.stringify({ brief: "A unit circle with labelled axes and one highlighted angle." }))
-				: textResponse("resp-prober-2", "msg-prober-2", "Teaching continues after the dispatch.");
-		}
-		// A text-only model that (wrongly) ran would still get an answer here:
-		// the regression's point is that NO request is made at all.
-		return textResponse(`resp-${role}`, `msg-${role}`, "done");
+		fetches.push({ url, method });
+		throw new Error(`unexpected fetch ${method} ${url}`);
 	};
 
-	// ── the production composition (imported AFTER env + network stub) ─────
+	// ── the production composition (imported AFTER env + network guard) ─────
 	const { handleChatRequest } = await import("../src/server/chat-handler.ts");
+	assert.equal(typeof handleChatRequest, "function", "chat-handler composition loads");
 	const { recoverStaleJobs, setTurnRunner } = await import("../src/server/jobs.ts");
 	const { chatStore } = await import("../src/store/chats.ts");
 	const { jobStore } = await import("../src/store/jobs.ts");
 	const { writeSettings } = await import("../src/store/settings.ts");
-	const { createSubscriptionStore } = await import("../src/store/subscription-credentials.ts");
 	const { PATHS } = await import("../config.ts");
-	const { runningTurn } = await import("../src/server/turn-runs.ts");
 	type JobRecord = import("../src/core/contracts.ts").JobRecord;
 
 	// The job composition is the surface under test; a real wake teacher turn
 	// would stack a second composition on top of it.
 	setTurnRunner(async () => 200);
-
-	const seedSubscriptionStore = async () => {
-		const store = createSubscriptionStore(path.resolve(PATHS.data, "subscription"));
-		await store.transaction(async (tx) => {
-			await tx.save({ ...tx.state, credential: grant("account-current") });
-		});
-		const generation = (await store.getSnapshot()).generation;
-		assert.ok(generation, "the seeded subscription store has a generation");
-		return generation;
-	};
 
 	const toolMessages = (toolCallId: string, name: string, args: unknown): unknown[] => [
 		{ id: "u1", role: "user", content: "please draw this", timestamp: 1 },
@@ -433,8 +345,8 @@ async function runChildScenario(mode: string): Promise<void> {
 			role: "assistant",
 			content: [{ type: "toolCall", id: toolCallId, name, arguments: args }],
 			api: "openai-completions",
-			provider: "openai-codex",
-			model: "gpt-6-luna",
+			provider: IMAGE_MODEL.provider,
+			model: IMAGE_MODEL.id,
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			stopReason: "toolUse",
 			timestamp: 1,
@@ -475,13 +387,13 @@ async function runChildScenario(mode: string): Promise<void> {
 
 	const seedChat = (title: string, messages: unknown[]) => {
 		const chat = chatStore.createChat(title);
-		chatStore.saveSettings(chat.id, { model: CODEX });
+		chatStore.saveSettings(chat.id, { model: IMAGE_MODEL });
 		chatStore.saveMessages(chat.id, messages as never);
 		return chat;
 	};
 
-	const seedJob = (chatId: string, kind: "visual" | "pdf", toolCallId: string, generation?: string): JobRecord =>
-		jobStore.createJob({ kind, chatId, toolCallId, ...(generation ? { subscriptionGeneration: generation } : {}) });
+	const seedJob = (chatId: string, kind: "visual" | "pdf", toolCallId: string): JobRecord =>
+		jobStore.createJob({ kind, chatId, toolCallId });
 
 	const waitForSettled = async (jobId: string, timeoutMs = 30_000): Promise<JobRecord> => {
 		const deadline = Date.now() + timeoutMs;
@@ -499,35 +411,48 @@ async function runChildScenario(mode: string): Promise<void> {
 		status: job.status,
 		error: job.error ?? null,
 		activity: job.activity ?? null,
-		subscriptionGeneration: job.subscriptionGeneration ?? null,
 		result: job.result ?? null,
 	});
+
+	if (mode === "recover-retired-cheap") {
+		writeSettings({
+			version: 1,
+			models: { strong: { model: IMAGE_MODEL }, cheap: { model: { provider: "openai-codex", id: "gpt-5.4" } } },
+		});
+		const before = JSON.stringify((await import("../src/store/settings.ts")).readSettings());
+		const chat = seedChat("valid conversation with a retired background slot", toolMessages("call-demo", "demo", { title: "Unit circle", brief: "Show a unit circle." }));
+		const job = jobStore.createJob({ kind: "demo", chatId: chat.id, toolCallId: "call-demo" });
+		recoverStaleJobs();
+		const settled = await waitForSettled(job.id);
+		assert.equal(JSON.stringify((await import("../src/store/settings.ts")).readSettings()), before, "refusal must not migrate the historical model selection");
+		print({ mode, fetches, jobs: [jobEvidence(settled)] });
+		return;
+	}
 
 	if (mode === "recover-visual" || mode === "recover-pdf") {
 		// A pre-existing record written by the PRE-FIX path: the text-only
 		// model is on disk (an override for visual; the vision slot for pdf),
-		// with a live subscription generation so the ONLY thing that can stop
-		// execution is the capability gate itself.
-		const generation = await seedSubscriptionStore();
+		// and every slot resolves through the ordinary api-key catalog so the
+		// ONLY thing that can stop execution is the capability gate itself.
 		if (mode === "recover-visual") {
 			writeSettings({
 				version: 1,
-				models: { strong: { model: CODEX }, vision: { model: CODEX } },
-				agent: { models: { visualMaker: { model: SPARK } } },
+				models: { strong: { model: IMAGE_MODEL }, vision: { model: IMAGE_MODEL } },
+				agent: { models: { visualMaker: { model: TEXT_MODEL } } },
 			});
 			const chat = seedChat(
 				"legacy: text-only visualMaker override",
 				toolMessages("call-visual", "visual", { brief: "A unit circle with labelled axes." }),
 			);
-			const job = seedJob(chat.id, "visual", "call-visual", generation);
+			const job = seedJob(chat.id, "visual", "call-visual");
 			recoverStaleJobs();
 			const settled = await waitForSettled(job.id);
-			print({ mode, endpoint: CODEX_ENDPOINT, fetches, roles, generation, jobs: [jobEvidence(settled)] });
+			print({ mode, fetches, jobs: [jobEvidence(settled)] });
 			return;
 		}
 		writeSettings({
 			version: 1,
-			models: { strong: { model: CODEX }, vision: { model: SPARK } },
+			models: { strong: { model: IMAGE_MODEL }, vision: { model: TEXT_MODEL } },
 		});
 		const pdfPath = path.join(PATHS.data, "legacy-lesson.pdf");
 		fs.writeFileSync(pdfPath, minimalPdf());
@@ -535,81 +460,10 @@ async function runChildScenario(mode: string): Promise<void> {
 			"legacy: text-only vision slot feeding pdfReader",
 			toolMessages("call-pdf", "pdf", { path: pdfPath, question: "What does the document show?" }),
 		);
-		const job = seedJob(chat.id, "pdf", "call-pdf", generation);
+		const job = seedJob(chat.id, "pdf", "call-pdf");
 		recoverStaleJobs();
 		const settled = await waitForSettled(job.id);
-		print({ mode, endpoint: CODEX_ENDPOINT, fetches, roles, generation, jobs: [jobEvidence(settled)] });
-		return;
-	}
-
-	if (mode === "dispatch-visual") {
-		const generation = await seedSubscriptionStore();
-		// Image-capable slots/tools exist, so the prober CAN dispatch `visual`;
-		// the legacy override is what pins the role to a text-only model.
-		writeSettings({
-			version: 1,
-			models: { strong: { model: CODEX }, vision: { model: CODEX } },
-			agent: { models: { visualMaker: { model: SPARK } } },
-		});
-		const chat = chatStore.createChat("legacy: dispatch against a text-only visualMaker");
-		chatStore.saveSettings(chat.id, { model: CODEX });
-		// Already past the probe: the TEACHER owns the `visual` dispatch tool
-		// (the prober's job subset is research + pdf).
-		chatStore.saveMessages(chat.id, [
-			{ id: "u0", role: "user", content: "teach me the unit circle", timestamp: 1 },
-			{
-				id: "a0",
-				role: "assistant",
-				content: [{ type: "toolCall", id: "call-probe-done", name: "probe_done", arguments: { assessment: "ready" } }],
-				api: "openai-completions",
-				provider: "openai-codex",
-				model: "gpt-6-luna",
-				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-				stopReason: "toolUse",
-				timestamp: 1,
-			},
-			{
-				id: "r0",
-				role: "toolResult",
-				toolCallId: "call-probe-done",
-				toolName: "probe_done",
-				content: [{ type: "text", text: "Probe complete." }],
-				details: "Probe complete.",
-				isError: false,
-				timestamp: 1,
-			},
-		] as never);
-		const ack = await handleChatRequest(
-			new Request("http://test/api/chat", {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ chatId: chat.id, input: { type: "text", text: "draw the unit circle" } }),
-			}),
-		);
-		const ackStatus = ack.status;
-		const ackBody = ackStatus === 200 ? "" : await ack.text();
-		const handle = runningTurn(chat.id);
-		const turnBody = handle ? await new Response(handle.subscribe()).text() : "";
-		let job: JobRecord | undefined;
-		const deadline = Date.now() + 30_000;
-		while (!job) {
-			job = jobStore.listJobs(chat.id).find((candidate) => candidate.kind === "visual");
-			if (job) break;
-			if (Date.now() > deadline) throw new Error(`dispatch never created a visual job (ack ${ackStatus} ${ackBody})`);
-			await new Promise((resolve) => setTimeout(resolve, 50));
-		}
-		const settled = await waitForSettled(job.id);
-		print({
-			mode,
-			endpoint: CODEX_ENDPOINT,
-			fetches,
-			roles,
-			generation,
-			ackStatus,
-			ackBody,
-			turnBody,
-			jobs: [jobEvidence(settled)],
-		});
+		print({ mode, fetches, jobs: [jobEvidence(settled)] });
 		return;
 	}
 

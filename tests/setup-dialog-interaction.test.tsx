@@ -44,7 +44,7 @@ let host: HTMLDivElement | null = null;
 let closed = 0;
 let completed = 0;
 
-async function mount({ keyed = false, catalogFails = false, subscriptionConnected = false } = {}) {
+async function mount({ keyed = false, catalogFails = false } = {}) {
 	closed = 0;
 	completed = 0;
 	globalThis.fetch = async (input, init) => {
@@ -64,14 +64,7 @@ async function mount({ keyed = false, catalogFails = false, subscriptionConnecte
 	root = createRoot(host);
 	function Harness() {
 		const [open, setOpen] = React.useState(true);
-		return (
-			<SetupDialog
-				open={open}
-				onClose={() => { closed++; setOpen(false); }}
-				onDone={() => { completed++; }}
-				subscriptionConnected={subscriptionConnected}
-			/>
-		);
+		return <SetupDialog open={open} onClose={() => { closed++; setOpen(false); }} onDone={() => { completed++; }} />;
 	}
 	await act(async () => { root!.render(<Harness />); });
 }
@@ -112,16 +105,6 @@ afterEach(async () => {
 });
 
 describe("setup polish interactions", () => {
-	it("a connected subscription opens the model pickers with zero API keys", async () => {
-		await mount({ subscriptionConnected: true });
-		assert.ok(document.querySelector('[data-testid="setup-dialog"]'));
-		assert.equal(
-			document.querySelector('[data-testid="setup-stage-keys"]'),
-			null,
-			"a connected subscription must not ask for a provider key",
-		);
-		assert.ok(document.querySelector('[data-testid="setup-stage-pickers"]'));
-	});
 	it("provider dropdown closes on a click elsewhere inside the dialog without closing setup", async () => {
 		await mount();
 		await click(element('[data-testid="setup-key-provider"]'));

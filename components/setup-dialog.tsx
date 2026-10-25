@@ -44,6 +44,8 @@ import { notifySettingsSaved, useSettingsSaved } from "@/components/settings-sig
 import { Hint } from "@/components/ui/hint";
 import { type ProviderKeyInfo } from "@/components/settings/keys-section";
 import { ProviderMenuList } from "@/components/settings/model-menu";
+import { ChatGPTBackgroundAccess } from "@/components/settings/chatgpt-connection";
+import { NativeSubscriptionBackgroundAccess, SubscriptionConnections } from "@/components/settings/subscription-connections";
 import { defaultOrderLevel, populateLevel, THINKING_LABEL } from "@/components/thinking-default";
 import { ThinkingMenuList } from "@/components/settings/model-menu";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
@@ -68,17 +70,10 @@ interface ModelsBody {
 }
 
 /** Pure: which stage the flow opens at — no keyed provider = keys first
- *  (owner's dependency ordering). A connected subscription is its own
- *  authorization source, so it opens the pickers with zero API keys; the
- *  fresh no-key/no-subscription path keeps the first-key screen. It does
- *  not stand in for a provider key. Exported for tests. */
+ *  (owner's dependency ordering). Exported for tests. */
 export function setupStage(
 	providers: { id: string; keyPresent: boolean }[] | null,
-	subscriptionConnected = false,
 ): "keys" | "pickers" {
-	// A connected subscription authorizes the pickers even while the keys
-	// read is still in flight; never flash the first-key screen at it.
-	if (subscriptionConnected) return "pickers";
 	if (providers === null) return "keys"; // fetch failed → the honest fallback
 	return providers.some((p) => p.keyPresent) ? "pickers" : "keys";
 }
@@ -154,7 +149,6 @@ export function SetupKeysBody({
 }) {
 	return (
 		<div className="flex flex-col gap-3 px-6 py-5" data-testid="setup-stage-keys">
-			<p className="text-sm text-foreground">Add a provider key.</p>
 			<p className="text-xs text-muted-foreground">
 				Choose your AI provider and paste its API key. You’ll pick your models next.
 			</p>
@@ -218,6 +212,7 @@ export function SetupKeysBody({
 					</p>
 				)}
 			</div>
+			<div className="mt-2 border-t border-border/60 pt-4"><h3 className="mb-3 font-ui text-xs text-muted-foreground">Subscriptions</h3><SubscriptionConnections setup /></div>
 		</div>
 	);
 }
@@ -228,15 +223,10 @@ export function SetupDialog({
 	/** Saved: the models section landed; the caller marks configured (the
 	 *  draft stays put — save never sends). */
 	onDone,
-	/** The live subscription authorization, when the caller already reads
-	 *  it. Connected with zero API keys opens the pickers, not the
-	 *  first-key screen. */
-	subscriptionConnected = false,
 }: {
 	open: boolean;
 	onClose: () => void;
 	onDone: (models: ModelsSettings) => void;
-	subscriptionConnected?: boolean;
 }) {
 	const backdropDismiss = useBackdropDismiss(onClose);
 	const [body, setBody] = useState<ModelsBody | null>(null);
@@ -277,16 +267,19 @@ export function SetupDialog({
 	// moment ago (stage 1's own screen) widens the pickers immediately.
 	useEffect(() => {
 		if (!open) return;
+		let cancelled = false;
+		setBody(null);
 		setPicked({});
 		setLevels({});
 		setError(null);
 		fetch("/api/keys")
 			.then((r) => r.json())
-			.then((b: { providers?: ProviderKeyInfo[] }) => setKeyProviders(b.providers ?? []))
-			.catch(() => setKeyProviders([]));
+			.then((b: { providers?: ProviderKeyInfo[] }) => { if (!cancelled) setKeyProviders(b.providers ?? []); })
+			.catch(() => { if (!cancelled) setKeyProviders([]); });
 		fetch("/api/models")
-			.then((r) => r.json())
+			.then((r) => { if (!r.ok) throw new Error("Catalog unavailable"); return r.json(); })
 			.then((b: ModelsBody) => {
+				if (cancelled) return;
 				setBody(b);
 				setFailed(false);
 				// Prefill (owner, 2026-09-22): each pinned tier opens with its
@@ -304,7 +297,8 @@ export function SetupDialog({
 				}
 				setLevels(preLevels);
 			})
-			.catch(() => setFailed(true));
+			.catch(() => { if (!cancelled) setFailed(true); });
+		return () => { cancelled = true; };
 	}, [open, keysTick]);
 
 	// Esc + outside-click — layered dismissal, closable WITHOUT
@@ -351,7 +345,7 @@ export function SetupDialog({
 
 	if (!open) return null;
 
-	const stage = failed ? "keys" : setupStage(body ? body.providers : null, subscriptionConnected);
+	const stage = failed ? "keys" : setupStage(body ? body.providers : null);
 	const allPicked = SLOT_ORDER.every((s) => picked[s]);
 
 	/** Stage 1's save: PUT the pasted key, dispatch the keys signal, and
@@ -484,6 +478,7 @@ export function SetupDialog({
 										)}
 									</span>
 									<span className="text-xs text-muted-foreground/70">{SLOT_META[slot].roster}</span>
+									{slot !== "strong" && <><ChatGPTBackgroundAccess provider={entry?.provider} /><NativeSubscriptionBackgroundAccess provider={entry?.provider} /></>}
 									<div className="flex items-center gap-2">
 										<div className="relative flex-1">
 											<button

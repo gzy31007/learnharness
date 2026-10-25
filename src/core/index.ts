@@ -19,6 +19,7 @@ export * from "./contracts.ts";
 export * from "./ports.ts";
 export * from "./chains.ts";
 export * from "./render-settings.ts";
+export { isRetiredModelProvider, RETIRED_MODEL_MESSAGE } from "./retired-model.ts";
 
 export * from "./question-core.ts";
 // The event bus (push architecture, 2026-10-02): vocabulary + emit/subscribe
@@ -48,6 +49,10 @@ export * from "./input-events.ts";
 export * from "./view.ts";
 export * from "./tool-parts.ts";
 export * from "./prices.ts";
+export * from "./context-usage.ts";
+export type { ChatGPTStatus, ChatGPTControlBridge } from "./contracts/chatgpt.ts";
+export { NATIVE_SUBSCRIPTIONS } from "./contracts/subscriptions.ts";
+export type { NativeSubscriptionProviderId, NativeSubscriptionLogicalId, NativeSubscriptionStatus, NativeSubscriptionSnapshot, NativeSubscriptionScope, NativeSubscriptionControlBridge, SubscriptionInteraction, SubscriptionPrompt } from "./contracts/subscriptions.ts";
 export * from "./cost-summary.ts";
 export * from "./fuzzy.ts";
 // settings.ts + settings-resolution.ts (settings-storage wave, 2026-09-19):
@@ -68,7 +73,6 @@ export * from "./session-navigation.ts";
 // shape rules + masking — pure, browser-safe (the auth page binds to the
 // /api/keys routes built on it).
 export * from "./auth-keys.ts";
-export * from "./subscription.ts";
 // keyboard.ts: the shortcut registry + binding normalization (pure, browser-safe).
 export * from "./keyboard.ts";
 export * from "./coverage.ts";

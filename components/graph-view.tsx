@@ -64,9 +64,11 @@
  */
 
 import { useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { NotesImportErrors, useNotesImport } from "@/components/notes-import.tsx";
 import Link from "next/link";
 import { FileTextIcon, ListTreeIcon, Loader2Icon, SearchIcon, SettingsIcon, UploadIcon, WaypointsIcon } from "lucide-react";
-import { incrementalLayout, propositionSessionHref, type CostCoverage, type GraphCostSummary, type GraphNode, type GraphSnapshot } from "@/src/core";
+import { incrementalLayout, propositionSessionHref, type GraphCostSummary, type GraphNode, type GraphSnapshot } from "@/src/core";
+import { planCostLabel } from "@/components/usage-format";
 import { GraphCanvasRenderer, type GraphRenderSettings } from "./graph-canvas.ts";
 import { usePopoverDismiss } from "@/components/popover-dismiss";
 import { useActivity } from "@/components/activity-dock";
@@ -293,8 +295,18 @@ function timeAgo(startedAt: number): string {
 
 /** Run/stage cost at 3 decimals (pipeline pennies are real money at this
  *  scale); headline totals use 2. Null (unpriced model) renders "—". */
-function fmtRunCost(dollars: number | null): string {
-	return dollars === null ? "—" : `$${dollars.toFixed(3)}`;
+function fmtRunCost(dollars: number | null, providers: readonly string[] = []): string {
+	return planCostLabel(dollars, providers, (value) => `$${value.toFixed(3)}`);
+}
+function graphProviders(value: { subscriptionRuns?: number; subscriptionProviders?: string[] }): string[] {
+	return value.subscriptionProviders ?? ((value.subscriptionRuns ?? 0) > 0 ? ["ChatGPT"] : []);
+}
+function graphUsageLabel(costs: Pick<GraphCostSummary, "stages">): string {
+	const stages = [costs.stages.extraction, costs.stages.audit];
+	const providers = [...new Set(stages.flatMap(graphProviders))];
+	const priced = stages.some((stage) => stage.runs - stage.unpricedRuns - (stage.subscriptionRuns ?? 0) > 0);
+	const dollars = displayCostTotals(costs).totalDollars;
+	return planCostLabel(priced ? dollars : null, providers, (value) => `$${value.toFixed(2)}`);
 }
 
 /**
@@ -307,30 +319,14 @@ function fmtRunCost(dollars: number | null): string {
  * so the recent-runs list carries extraction runs only.)
  */
 export function displayCostTotals(costs: Pick<GraphCostSummary, "stages">): {
-	/** Estimated USD over the displayed stages; null when none could price
-	 *  (render "—", never $0). */
-	totalDollars: number | null;
-	/** What the total covers — a priced subtotal is "partial", not complete. */
-	coverage: CostCoverage;
+	totalDollars: number;
 	unpricedRuns: number;
 } {
 	// The two live stages (the spine came and went on one day,
-	// 2026-09-30 — digest-aware extraction replaced it). Stages that never
-	// ran are not gaps: they contribute nothing and don't mark the total
-	// partial.
-	const stages = [costs.stages.extraction, costs.stages.audit].filter((stage) => stage.runs > 0);
-	const priced = stages.filter((stage) => stage.dollars !== null);
-	const totalDollars = priced.length > 0 ? priced.reduce((sum, stage) => sum + (stage.dollars ?? 0), 0) : null;
-	const unpricedRuns = stages.reduce((sum, stage) => sum + stage.unpricedRuns, 0);
+	// 2026-09-30 — digest-aware extraction replaced it).
 	return {
-		totalDollars,
-		coverage:
-			totalDollars === null
-				? "unknown"
-				: stages.some((stage) => stage.coverage !== "complete")
-					? "partial"
-					: "complete",
-		unpricedRuns,
+		totalDollars: costs.stages.extraction.dollars + costs.stages.audit.dollars,
+		unpricedRuns: costs.stages.extraction.unpricedRuns + costs.stages.audit.unpricedRuns,
 	};
 }
 
@@ -349,29 +345,22 @@ export function GraphCostControl({ costs }: { costs: GraphCostSummary }) {
 	// wraps button + panel, so the toggle itself keeps working.
 	const rootRef = useRef<HTMLDivElement>(null);
 	usePopoverDismiss(rootRef, open, () => setOpen(false));
-	const totals = displayCostTotals(costs);
 	return (
 		<div ref={rootRef} className="relative">
 			<Hint
-				// Trimmed (owner, subtlety round 2026-09-25); now names what the
-				// number IS — inferred from the price table, not a subscription bill.
-				label="Estimated model cost (graph pipeline). Click for details."
+				// Trimmed (owner, subtlety round 2026-09-25).
+				label="Graph costs — click for details"
 				side="bottom"
 			>
 				<button
 				type="button"
 				aria-expanded={open}
-				aria-label="Estimated model cost"
 				onClick={() => setOpen((o) => !o)}
-				data-testid="graph-cost-pill"
 				className={`rounded-lg px-2 py-1 text-xs tabular-nums transition-colors hover:bg-accent ${
 					open ? "text-foreground" : "text-muted-foreground hover:text-foreground"
 				}`}
 			>
-				{totals.totalDollars === null ? "—" : `$${totals.totalDollars.toFixed(2)}`}
-				{totals.coverage === "partial" && (
-					<span className="text-muted-foreground"> (partial)</span>
-				)}
+				{graphUsageLabel(costs)}
 			</button>
 			</Hint>
 			{open && (
@@ -387,14 +376,11 @@ export function GraphCostControl({ costs }: { costs: GraphCostSummary }) {
  * The cost control's expanded panel: stage totals (extraction / audit —
  * dollars headline, tokens secondary) + the recent-runs list.
  * Presentational: the fold happens server-side (core/cost-summary.ts);
- * dollars are inferred read-time, never stored, and are therefore an
- * ESTIMATED MODEL COST — the header says so, and every figure carries
- * its coverage: "—" when nothing could be priced (never $0), "partial"
- * when the dollars omit an unpriced model or unreported usage. Cluster
- * naming is GONE from the panel (owner refinement round, 2026-09-24):
- * labels are session titles / file names now, the namer is dead, and its
- * historical spend is not tracked anymore — the headline sums the
- * displayed stages only and naming-kind runs never reach the list.
+ * dollars are inferred read-time, never stored. Cluster naming is GONE
+ * from the panel (owner refinement round, 2026-09-24): labels are session
+ * titles / file names now, the namer is dead, and its historical spend is
+ * not tracked anymore — the headline sums the displayed stages only and
+ * naming-kind runs never reach the list.
  */
 function GraphCostPanel({ costs }: { costs: GraphCostSummary }) {
 	const stageRows: [string, GraphCostSummary["stages"]["extraction"]][] = [
@@ -403,21 +389,15 @@ function GraphCostPanel({ costs }: { costs: GraphCostSummary }) {
 	];
 	// The displayed figures come from displayCostTotals (naming excluded —
 	// the pill and this panel must agree).
-	const { totalDollars, coverage, unpricedRuns } = displayCostTotals(costs);
+	const { unpricedRuns } = displayCostTotals(costs);
 	return (
 		<div className="w-80 max-w-[calc(100vw-1.5rem)] rounded-xl border bg-card/95 p-3 text-xs shadow-lg backdrop-blur">
 			<div className="mb-2 flex items-baseline justify-between">
-				<span
-					className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground"
-					title="Estimated model cost"
-				>
-					Estimated model cost
+				<span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+					Graph pipeline costs
 				</span>
-				<span className="text-foreground tabular-nums" data-testid="graph-cost-total" title="Estimated model cost">
-					{totalDollars === null ? "—" : `$${totalDollars.toFixed(2)}`}
-					{coverage === "partial" && (
-						<span className="text-muted-foreground"> (partial)</span>
-					)}
+				<span className="text-foreground tabular-nums">
+					{graphUsageLabel(costs)}
 					{unpricedRuns > 0 && (
 						<span className="text-muted-foreground"> · {unpricedRuns} unpriced</span>
 					)}
@@ -427,16 +407,10 @@ function GraphCostPanel({ costs }: { costs: GraphCostSummary }) {
 				{stageRows.map(([label, stage]) => (
 					<div key={label} className="flex items-baseline justify-between gap-2 text-[11px]">
 						<span className="shrink-0 text-muted-foreground">{label}</span>
-						<span className="min-w-0 text-right tabular-nums" title="Estimated model cost">
-							{stage.runs === 0 ? "—" : fmtRunCost(stage.dollars)}
-							{stage.coverage === "partial" && (
-								<span className="text-muted-foreground"> (partial)</span>
-							)}
-							{stage.unpricedRuns > 0 && (
-								<span className="text-muted-foreground"> · {stage.unpricedRuns} unpriced</span>
-							)}
-							{stage.missingUsageRuns > 0 && (
-								<span className="text-muted-foreground"> · {stage.missingUsageRuns} missing usage</span>
+						<span className="min-w-0 text-right tabular-nums">
+							{fmtRunCost(stage.runs - stage.unpricedRuns - (stage.subscriptionRuns ?? 0) <= 0 ? null : stage.dollars, graphProviders(stage))}
+							{stage.unpricedRuns > 0 && (stage.runs - stage.unpricedRuns - (stage.subscriptionRuns ?? 0) > 0 || (stage.subscriptionRuns ?? 0) > 0) && (
+								<span className="text-muted-foreground"> +{stage.unpricedRuns} unpriced</span>
 							)}
 							<span className="text-muted-foreground">
 								{" "}
@@ -459,12 +433,7 @@ function GraphCostPanel({ costs }: { costs: GraphCostSummary }) {
 									</span>
 								)}
 							</span>
-							<span className="shrink-0 tabular-nums" title="Estimated model cost">
-								{fmtRunCost(run.dollars)}
-								{run.coverage === "partial" && (
-									<span className="text-muted-foreground"> (partial)</span>
-								)}
-							</span>
+							<span className="shrink-0 tabular-nums">{fmtRunCost(run.dollars, graphProviders(run))}{run.dollars === null && run.subscriptionRuns === 1 ? " +1 unpriced" : ""}</span>
 						</div>
 					))}
 			</div>
@@ -1131,29 +1100,19 @@ export function GraphView({
 	// /api/graph/import; the runs surface in the status chips below, and the
 	// graph refetches when they finish (the runs-empty transition).
 	const fileInputRef = useRef<HTMLInputElement>(null);
-	const [importing, setImporting] = useState(false);
 	// The dock's start-site nudge (accuracy wave, 2026-09-19): the import
 	// POST awaits the WHOLE pipeline server-side, so the run registers long
 	// before the response — nudge at click and again at +600ms to catch the
 	// start; from its first setPhase the run announces itself on the events
 	// channel (S5), and the dock rides those announcements thereafter.
 	const refreshActivity = useActivity().refresh;
-	const onImportFiles = (files: FileList | null) => {
-		if (!files || files.length === 0) return;
-		setImporting(true);
-		refreshActivity();
-		setTimeout(() => refreshActivity(), 600);
-		const form = new FormData();
-		for (const file of Array.from(files)) form.append("files", file);
-		fetch("/api/graph/import", { method: "POST", body: form })
-			.then(async (res) => {
-				const body = (await res.json()) as { results: { filePath: string; ok: boolean }[] };
-				const failed = body.results.filter((r) => !r.ok);
-				if (failed.length > 0) console.error("notes import failed for:", failed);
-			})
-			.catch((err) => console.error("import failed:", err))
-			.finally(() => setImporting(false));
-	};
+	const notesImport = useNotesImport({
+		onStart: () => {
+			refreshActivity();
+			setTimeout(() => refreshActivity(), 600);
+		},
+	});
+	const { importing, onImportFiles } = notesImport;
 
 	// Background pipeline status: read /api/graph/status; whenever a run
 	// LEAVES the feed (finished / aborted / failed), refetch the graph.
@@ -1657,6 +1616,7 @@ export function GraphView({
 				/>
 			</div>
 
+			<NotesImportErrors errors={notesImport.errors} />
 			{/* Top-right tail (owner, 2026-09-20): the pipeline cost number —
 			    just a number, hover-highlighted, dropdown breakdown — then
 			    the running-pipeline pills under it. Lives BELOW the actions

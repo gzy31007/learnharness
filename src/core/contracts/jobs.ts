@@ -6,7 +6,7 @@
  * master. Pure types + protocol docs + tiny pure helpers; type-only imports
  * of "ai" (safe everywhere: server, client, tests). See docs/vision.md.
  */
-import { totalInputOf, usagePresenceOf, type CallUsage, type UsagePresence } from "./chat.ts";
+import type { CallUsage } from "./chat.ts";
 import type { LhMessage, LhMarkerMessage } from "../native-messages.ts";
 import { newHandoffMessage } from "../native-messages.ts";
 
@@ -34,13 +34,6 @@ export interface JobRecord {
 	 * inferred at read time (core/prices.ts). Absent on pre-2026-09 jobs and
 	 * until the runner's capture lands — renderers show "—", never zero. */
 	usage?: JobUsage;
-	/** Subscription generation provenance (source-aware execution, issue
-	 *  #8): the instance-subscription generation this job was spawned
-	 *  under. ABSENT = no subscription session in the spawning scope — a
-	 *  subscription-source job without it is refused on recovery, never
-	 *  replayed against a newer account. Optional and record-compatible:
-	 *  no schema version bump, no migration of old records. */
-	subscriptionGeneration?: string;
 }
 
 /** A sub-agent run's accumulated usage — the same accounting shape as a
@@ -50,7 +43,7 @@ export interface JobRecord {
  * money-channel doctrine; cost renders "—", never $0). */
 export interface JobUsage {
 	/** The model that ran the sub-agent, provider-qualified ("provider:id" —
-	 *  model slots wave, 2026-09-20; matches PRICES' uniform keys). */
+	 *  model slots wave, 2026-09-20; matches Pi catalog lookup keys). */
 	model: string;
 	/** Running totals summed over the run's model calls so far. */
 	inputTokens: number | undefined;
@@ -58,6 +51,10 @@ export interface JobUsage {
 	cacheReadTokens: number | undefined;
 	cacheWriteTokens: number | undefined;
 	reasoningTokens: number | undefined;
+	cacheWrite1hTokens?: number;
+	/** Individual calls for current-catalog per-call tier pricing. Absent on
+	 * older jobs; never backfill them from cumulative totals. */
+	calls?: CallUsage[];
 	/** How many model calls the run has made (each bills separately). */
 	steps: number;
 	/** The MOST RECENT model call's accounting (2026-09 dock contract): the
@@ -74,41 +71,27 @@ export interface JobUsage {
  * object with these fields folds, including the real thing and test fakes). */
 export interface UsageStepLike {
 	inputTokens?: number | undefined;
-	inputTokenDetails?: { cacheReadTokens?: number; cacheWriteTokens?: number } | undefined;
+	inputTokenDetails?: { cacheReadTokens?: number; cacheWriteTokens?: number; cacheWrite1hTokens?: number } | undefined;
 	outputTokens?: number | undefined;
 	outputTokenDetails?: { reasoningTokens?: number } | undefined;
 }
 
 /** pi-ai's Usage shape (input/output/cacheRead/cacheWrite/reasoning?) →
  * UsageStepLike. Structural — no pi import here; the engine band maps at
- * its boundaries.
- *
- * `presence` is the supplier's FIELD-LEVEL usage presence (see
- * messageUsagePresence, contracts/chat.ts): the SDK always carries numbers,
- * so an unreported field must project to UNKNOWN (undefined) rather than a
- * fake zero. Each reported field survives on its own (plan law: preserve
- * each obtained token field), and the reported cache parts are added back
- * into the total input the fold prices against. */
+ * its boundaries. */
 export function piUsageToStep(usage: {
 	input: number;
 	output: number;
 	cacheRead: number;
 	cacheWrite: number;
+	cacheWrite1h?: number;
 	reasoning?: number;
-}, presence: boolean | Partial<UsagePresence> = true): UsageStepLike {
-	const reported = usagePresenceOf(presence);
-	const cacheReadTokens = reported.cacheRead ? usage.cacheRead : undefined;
-	const cacheWriteTokens = reported.cacheWrite ? usage.cacheWrite : undefined;
-	const reasoningTokens = reported.reasoning ? usage.reasoning ?? 0 : undefined;
-	const inputTokenDetails =
-		cacheReadTokens !== undefined || cacheWriteTokens !== undefined
-			? { cacheReadTokens, cacheWriteTokens }
-			: undefined;
+}): UsageStepLike {
 	return {
-		inputTokens: reported.input ? totalInputOf(usage, reported) : undefined,
-		outputTokens: reported.output ? usage.output : undefined,
-		inputTokenDetails,
-		outputTokenDetails: reasoningTokens !== undefined ? { reasoningTokens } : undefined,
+		inputTokens: usage.input,
+		outputTokens: usage.output,
+		inputTokenDetails: { cacheReadTokens: usage.cacheRead, cacheWriteTokens: usage.cacheWrite, cacheWrite1hTokens: usage.cacheWrite1h ?? 0 },
+		outputTokenDetails: usage.reasoning !== undefined ? { reasoningTokens: usage.reasoning } : undefined,
 	};
 }
 
@@ -123,6 +106,14 @@ export function accumulateJobUsage(
 ): JobUsage {
 	const add = (a: number | undefined, b: number | undefined): number | undefined =>
 		a === undefined && b === undefined ? undefined : (a ?? 0) + (b ?? 0);
+	const call: CallUsage = {
+		inputTokens: step.inputTokens,
+		outputTokens: step.outputTokens,
+		cacheReadTokens: step.inputTokenDetails?.cacheReadTokens,
+		cacheWriteTokens: step.inputTokenDetails?.cacheWriteTokens,
+		cacheWrite1hTokens: step.inputTokenDetails?.cacheWrite1hTokens,
+		reasoningTokens: step.outputTokenDetails?.reasoningTokens,
+	};
 	return {
 		model,
 		inputTokens: add(total?.inputTokens, step.inputTokens),
@@ -130,14 +121,12 @@ export function accumulateJobUsage(
 		cacheReadTokens: add(total?.cacheReadTokens, step.inputTokenDetails?.cacheReadTokens),
 		cacheWriteTokens: add(total?.cacheWriteTokens, step.inputTokenDetails?.cacheWriteTokens),
 		reasoningTokens: add(total?.reasoningTokens, step.outputTokenDetails?.reasoningTokens),
+		cacheWrite1hTokens: ((total?.cacheWriteTokens ?? 0) > 0 && total?.cacheWrite1hTokens === undefined) ||
+			((call.cacheWriteTokens ?? 0) > 0 && call.cacheWrite1hTokens === undefined)
+			? undefined : add(total?.cacheWrite1hTokens, call.cacheWrite1hTokens),
 		steps: (total?.steps ?? 0) + 1,
-		lastStep: {
-			inputTokens: step.inputTokens,
-			outputTokens: step.outputTokens,
-			cacheReadTokens: step.inputTokenDetails?.cacheReadTokens,
-			cacheWriteTokens: step.inputTokenDetails?.cacheWriteTokens,
-			reasoningTokens: step.outputTokenDetails?.reasoningTokens,
-		},
+		...(!total || total.calls ? { calls: [...(total?.calls ?? []), call] } : {}),
+		lastStep: call,
 	};
 }
 
@@ -287,10 +276,6 @@ export interface SubagentResultMeta {
 	 * the teacher is told so its promise of a result doesn't hang
 	 * silently in the lesson. */
 	aborted?: true;
-	/** The job's subscription generation (source-aware execution, issue
-	 *  #8) — the wake runs under it, never under whatever account is
-	 *  current by delivery time. */
-	subscriptionGeneration?: string;
 }
 
 /** The data-subagent-artifact part payload: what the UI renders. */
@@ -385,7 +370,7 @@ function steerText(kind: JobKind, result: ResearchResult | DemoResult | VisualRe
  * idempotent.
  */
 export function buildSubagentSteer(
-	job: Pick<JobRecord, "id" | "kind" | "toolCallId" | "subscriptionGeneration">,
+	job: Pick<JobRecord, "id" | "kind" | "toolCallId">,
 	result: ResearchResult | DemoResult | VisualResult | PdfResult,
 ): SteerMessage {
 	return {
@@ -399,7 +384,6 @@ export function buildSubagentSteer(
 			kind: job.kind,
 			toolCallId: job.toolCallId,
 			result,
-			...(job.subscriptionGeneration ? { subscriptionGeneration: job.subscriptionGeneration } : {}),
 		},
 		timestamp: Date.now(),
 	};
@@ -409,15 +393,9 @@ export function buildSubagentSteer(
  * abort path in src/server/jobs.ts and tests). Same id space as the result
  * steer (same id space — exactly one delivers). */
 export function buildAbortSteer(
-	job: Pick<JobRecord, "id" | "kind" | "toolCallId" | "subscriptionGeneration">,
+	job: Pick<JobRecord, "id" | "kind" | "toolCallId">,
 ): SteerMessage {
-	const meta = {
-		jobId: job.id,
-		kind: job.kind,
-		toolCallId: job.toolCallId,
-		aborted: true as const,
-		...(job.subscriptionGeneration ? { subscriptionGeneration: job.subscriptionGeneration } : {}),
-	};
+	const meta = { jobId: job.id, kind: job.kind, toolCallId: job.toolCallId, aborted: true } as const;
 	return {
 		id: `steer_${job.id}`,
 		role: "custom",

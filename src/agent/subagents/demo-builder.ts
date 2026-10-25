@@ -1,7 +1,6 @@
 import { Type } from "typebox";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { Usage } from "@earendil-works/pi-ai";
-import type { UsagePresence } from "../../core/contracts/chat.ts";
 import { serverExecute } from "../tool-execute.ts";
 import type { PiEngine } from "../models.ts";
 import { runSubagent } from "./pi-run.ts";
@@ -42,7 +41,7 @@ export interface DemoBuilderOptions {
 	/** Kills the run mid-model-call (2026-09 real-kill abort semantics). */
 	abortSignal?: AbortSignal;
 	/** Money channel: one call per agent step, folded into JobRecord.usage. */
-	onUsage?: (usage: Usage, presence: boolean | Partial<UsagePresence>) => void;
+	onUsage?: (usage: Usage) => void;
 	/** Debug: raw provider-event recording key (LH_PROVIDER_EVENTS=1). */
 	chatId?: string;
 }
@@ -212,7 +211,7 @@ export async function runDemoBuilder(input: DemoBuilderInput, opts: DemoBuilderO
 			prompt,
 			maxTurns: opts.maxSteps ?? 24,
 			abortSignal: opts.abortSignal,
-			onUsage: (usage, presence) => opts.onUsage?.(usage, presence),
+			onUsage: (usage) => opts.onUsage?.(usage),
 			onToolStart: (toolName) => opts.onActivity?.(toolName),
 			chatId: opts.chatId,
 		});

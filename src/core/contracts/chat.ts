@@ -87,8 +87,8 @@ export interface ChatSettings {
  *  billed (CallUsage per agent step). Steps, not a sum: cost and context
  *  folds happen at read time (core/prices.ts). */
 export interface ExtractionStageUsage {
-	/** The model that ran this stage, provider-qualified ("provider:id" —
-	 *  model slots wave, 2026-09-20; matches PRICES' uniform keys). */
+	/** The model that ran this stage, provider-qualified ("provider:id")
+	 * for key-independent Pi catalog lookup at read time. */
 	model: string;
 	steps: CallUsage[];
 }
@@ -118,7 +118,7 @@ export interface ExtractionRunUsage {
  * flattened to the fields we persist (undefined = provider didn't report;
  * renderers show absent, never zero). */
 export interface CallUsage {
-	/** Total input (prompt) tokens, cached portion included. */
+	/** Pi-normalized fresh input tokens; cache buckets are disjoint. */
 	inputTokens: number | undefined;
 	outputTokens: number | undefined;
 	/** Cached input tokens READ (billed at the cache-read rate, if any). */
@@ -126,106 +126,11 @@ export interface CallUsage {
 	/** Input tokens written to the cache this call (OpenRouter bills writes
 	 * for some providers; undefined = not reported/not billed). */
 	cacheWriteTokens: number | undefined;
+	/** Subset of cacheWriteTokens written with one-hour retention. Missing
+	 * on older logs; new native captures explicitly record zero if absent. */
+	cacheWrite1hTokens?: number;
 	/** The reasoning portion of the output tokens. */
 	reasoningTokens: number | undefined;
-}
-
-/** Diagnostic type the source engine stamps on every assistant message it
- *  finishes: WHICH usage fields did the supplier actually report for that
- *  call? The SDK seeds usage with zeros at stream start, so a zero is only
- *  evidence when this marker says that field was reported. Absent (other
- *  providers, scripted engines) means "assume every field reported" — the
- *  pre-existing capture behavior. */
-export const USAGE_REPORT_DIAGNOSTIC = "usage_report";
-
-/** Field-level usage presence (see CallUsage: undefined = provider didn't
- *  report). Plan law: preserve EACH obtained token field — an input-only
- *  report keeps its input tokens while output stays unknown; a missing
- *  cache report never becomes a supplier-reported zero. */
-export interface UsagePresence {
-	input: boolean;
-	output: boolean;
-	cacheRead: boolean;
-	cacheWrite: boolean;
-	reasoning: boolean;
-}
-
-/** Normalize any presence carrier (legacy boolean, field object, or absent
- *  marker) to the full field map. Absent means "assume reported". */
-export function usagePresenceOf(presence: boolean | Partial<UsagePresence> | undefined): UsagePresence {
-	if (presence === undefined) return { input: true, output: true, cacheRead: true, cacheWrite: true, reasoning: true };
-	if (typeof presence === "boolean") {
-		return { input: presence, output: presence, cacheRead: presence, cacheWrite: presence, reasoning: presence };
-	}
-	const reported = (value: unknown): boolean => value === true;
-	return {
-		input: reported(presence.input),
-		output: reported(presence.output),
-		cacheRead: reported(presence.cacheRead),
-		cacheWrite: reported(presence.cacheWrite),
-		reasoning: reported(presence.reasoning),
-	};
-}
-
-/** The message-level field presence signal. Marker details carry a legacy
- *  `reported` boolean (both priced sides) and the field map; a boolean-only
- *  marker from the first wave still reads field-for-field. */
-export function messageUsagePresence(message: {
-	diagnostics?: readonly { type?: string; details?: { reported?: unknown; fields?: unknown } }[];
-}): UsagePresence {
-	const marker = message.diagnostics?.find((diagnostic) => diagnostic.type === USAGE_REPORT_DIAGNOSTIC);
-	if (!marker) return usagePresenceOf(undefined);
-	const details = marker.details;
-	if (details?.fields && typeof details.fields === "object") {
-		return usagePresenceOf(details.fields as Partial<UsagePresence>);
-	}
-	if (typeof details?.reported === "boolean") return usagePresenceOf(details.reported);
-	return usagePresenceOf(undefined);
-}
-
-/** Both priced sides reported — the legacy whole-call question. An
- *  input-only call is still an unreported call in this sense (it cannot be
- *  priced), even though its own token survives capture. */
-export function messageUsageReported(message: {
-	diagnostics?: readonly { type?: string; details?: { reported?: unknown; fields?: unknown } }[];
-}): boolean {
-	const presence = messageUsagePresence(message);
-	return presence.input && presence.output;
-}
-
-/** pi's Usage → the model's TOTAL input. pi normalizes every provider to
- *  FRESH input (openai-responses-shared.js: input = raw - cached -
- *  cache-write; openai-completions.js does the same), while CallUsage stores
- *  the total and the price fold subtracts the cache part ONCE. Restoring the
- *  reported cache parts here is what prevents a double discount. */
-export function totalInputOf(
-	usage: { input: number; cacheRead: number; cacheWrite: number },
-	presence: UsagePresence,
-): number {
-	return usage.input + (presence.cacheRead ? usage.cacheRead : 0) + (presence.cacheWrite ? usage.cacheWrite : 0);
-}
-
-/** One model call's capture projection: the SDK usage block plus its field
- *  presence → the persisted CallUsage. Unreported fields stay undefined
- *  (unknown money), reported zeros stay real zeros, and each obtained token
- *  field survives on its own. */
-export function callUsageOf(usage: {
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
-	reasoning?: number;
-}, presence: boolean | Partial<UsagePresence> = true): CallUsage {
-	const reported = usagePresenceOf(presence);
-	return {
-		inputTokens: reported.input ? totalInputOf(usage, reported) : undefined,
-		outputTokens: reported.output ? usage.output : undefined,
-		cacheReadTokens: reported.cacheRead ? usage.cacheRead : undefined,
-		cacheWriteTokens: reported.cacheWrite ? usage.cacheWrite : undefined,
-		// Optional in pi's Usage (providers that never emit reasoning
-		// tokens leave it unset) — persisted as 0, never dropped.
-		reasoningTokens: reported.reasoning ? usage.reasoning ?? 0 : undefined,
-	};
 }
 
 /** One billing turn: one full invocation of the teacher (a client turn or a
@@ -242,8 +147,8 @@ export interface TurnUsage {
 	 *  entry to the transcript (the block this turn "belongs" to). */
 	messageId: string;
 	at: string;
-	/** The model that ran the turn, provider-qualified ("provider:id" —
-	 *  model slots wave, 2026-09-20; matches PRICES' uniform keys). */
+	/** The model that ran the turn, provider-qualified ("provider:id")
+	 * for key-independent Pi catalog lookup at read time. */
 	model: string;
 	/** One entry per agent step (model call) in this turn. */
 	steps: CallUsage[];
