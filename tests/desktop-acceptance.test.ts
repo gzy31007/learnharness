@@ -2,13 +2,36 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { createRequire } from "node:module";
 import path from "node:path";
 import { test as nodeTest } from "node:test";
 
 const test = process.platform === "linux" ? nodeTest : nodeTest.skip;
 const runner = path.resolve("scripts/desktop-acceptance.mjs");
-const expectedChecks: string[] = createRequire(import.meta.url)("../scripts/desktop-acceptance-contract.cjs");
+// An independent wire-format fixture: do not derive the oracle from production internals.
+const expectedChecks = [
+	"production loopback home",
+	"real preload in isolated context via CDP",
+	"context isolation",
+	"node integration disabled",
+	"desktop platform",
+	"ChatGPT available and empty",
+	"native provider IDs",
+	"native providers available and disconnected",
+	"status has no token credential or API-key fields",
+	"three subscription connection rows",
+	"no retired web OAuth entry in rendered settings",
+	"ChatGPT notice cancels without login",
+	"GitHub Copilot notice label",
+	"Grok notice label",
+	"empty-account controls leave ChatGPT disconnected",
+	"empty-account native controls remain available disconnected",
+	"desktop model API accessible",
+	"retired subscription API absent",
+	"retired subscription attempt API absent",
+	"untrusted Web renderer has no desktop preload",
+	"untrusted Web renderer denied private model API",
+	"untrusted Web renderer denied private key API",
+];
 const passingReport = `const report = {runId: process.env.LH_ACCEPTANCE_RUN_ID, completed: true, success: true, timeout: false, assertions: ${JSON.stringify(expectedChecks.map((name) => ({ name, pass: true, actual: true, expected: true })))}};`;
 const saveReport = "fs.writeFileSync(process.env.LH_ACCEPTANCE_RESULT, JSON.stringify(report));";
 
