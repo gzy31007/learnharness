@@ -232,6 +232,8 @@ function runScenario(mode: string): Promise<ChildResult> {
 			NEXT_TELEMETRY_DISABLED: "1",
 			NO_PROXY: "localhost,127.0.0.1,::1",
 			LH_ROLE_CAPABILITY_MODE: mode,
+			// Electron's executable needs Node mode in these allowlisted child environments.
+			...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: "1" } : {}),
 			// Carries the external network guard when the evidence runner sets it.
 			...(process.env.NODE_OPTIONS ? { NODE_OPTIONS: process.env.NODE_OPTIONS } : {}),
 		},
@@ -284,6 +286,21 @@ describe("recovery: a pre-existing text-only image role is refused, not executed
 		assert.match(job.error ?? "", /missing: vision/);
 		const result = job.result as { notes?: string; brief?: string };
 		assert.match(result.notes ?? result.brief ?? "", /FAILED|PDF failed/);
+	});
+});
+
+describe("recovery: a retired background model is refused without an unhandled rejection", () => {
+	it("keeps a valid conversation model while settling a job pinned through the retired cheap slot", { timeout: 60_000 }, async () => {
+		const evidence = await scenario("recover-retired-cheap");
+		assert.deepEqual(evidence.fetches, [], "the retired role must not send ANY model request");
+		const job = evidence.jobs[0]!;
+		assert.equal(job.kind, "demo");
+		assert.equal(job.status, "error", `job did not settle: ${JSON.stringify(job)}`);
+		assert.match(job.error ?? "", /retired Codex connection/);
+		assert.match(job.error ?? "", /Select a model again/);
+		const result = job.result as { html?: string; notes?: string };
+		assert.equal(result.html, "");
+		assert.match(result.notes ?? "", /Select a model again/);
 	});
 });
 
@@ -396,6 +413,21 @@ async function runChildScenario(mode: string): Promise<void> {
 		activity: job.activity ?? null,
 		result: job.result ?? null,
 	});
+
+	if (mode === "recover-retired-cheap") {
+		writeSettings({
+			version: 1,
+			models: { strong: { model: IMAGE_MODEL }, cheap: { model: { provider: "openai-codex", id: "gpt-5.4" } } },
+		});
+		const before = JSON.stringify((await import("../src/store/settings.ts")).readSettings());
+		const chat = seedChat("valid conversation with a retired background slot", toolMessages("call-demo", "demo", { title: "Unit circle", brief: "Show a unit circle." }));
+		const job = jobStore.createJob({ kind: "demo", chatId: chat.id, toolCallId: "call-demo" });
+		recoverStaleJobs();
+		const settled = await waitForSettled(job.id);
+		assert.equal(JSON.stringify((await import("../src/store/settings.ts")).readSettings()), before, "refusal must not migrate the historical model selection");
+		print({ mode, fetches, jobs: [jobEvidence(settled)] });
+		return;
+	}
 
 	if (mode === "recover-visual" || mode === "recover-pdf") {
 		// A pre-existing record written by the PRE-FIX path: the text-only

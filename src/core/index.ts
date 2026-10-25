@@ -19,6 +19,7 @@ export * from "./contracts.ts";
 export * from "./ports.ts";
 export * from "./chains.ts";
 export * from "./render-settings.ts";
+export { isRetiredModelProvider, RETIRED_MODEL_MESSAGE } from "./retired-model.ts";
 
 export * from "./question-core.ts";
 // The event bus (push architecture, 2026-10-02): vocabulary + emit/subscribe

@@ -445,12 +445,19 @@ test("scope-disabled credentials remain revocable and unconfirmed revoke never c
 	} finally { f.service.close(); }
 });
 
-test("repeated real verified sign-in creates one visible account while preserving separately bound registrations until explicit forgetting", async () => {
-	const f = await loggedIn();
+test("repeated real verified sign-in creates one visible account while preserving separately bound registrations until explicit forgetting", { timeout: 10_000 }, async () => {
+	const repeatedComplete = deferred();
+	let repeatedArmed = false, sawPending = false;
+	const f = await loggedIn({ change: (push) => {
+		if (!repeatedArmed) return;
+		if (push.status.pending) sawPending = true;
+		else if (sawPending) repeatedComplete.resolve();
+	} });
 	try {
 		const original = f.saved.registrations[0];
-		await f.service.login(); await f.callback({ client_id: "oaiapp_repeat" });
-		for (let i = 0; i < 100 && (await f.service.status()).pending; i++) await new Promise((r) => setImmediate(r));
+		repeatedArmed = true;
+		await f.service.login(); assert.equal(sawPending, true); await f.callback({ client_id: "oaiapp_repeat" });
+		await repeatedComplete.promise;
 		const status = await f.service.status();
 		assert.equal(f.saved.registrations.length, 2); assert.equal(status.accounts.length, 1);
 		assert.equal(status.activeId, status.accounts[0].id); assert.notEqual(status.activeId, original.id);
@@ -581,10 +588,16 @@ test("disconnect persistence failure is not reported as local forgetting and lea
 	} finally { f.service.close(); }
 });
 
-test("one app-wide background preference defaults ON over legacy OFF, persists with zero accounts, and never changes on auth/account operations", async () => {
+test("one app-wide background preference defaults ON over legacy OFF, persists with zero accounts, and never changes on auth/account operations", { timeout: 10_000 }, async () => {
 	const first = await loggedIn(); first.service.close();
 	const legacy = structuredClone(first.saved); legacy.registrations[0].background = false;
-	const f = fixture({ state: legacy });
+	const reconnectComplete = deferred();
+	let reconnectArmed = false, sawPending = false;
+	const f = fixture({ state: legacy, change: (push) => {
+		if (!reconnectArmed) return;
+		if (push.status.pending) sawPending = true;
+		else if (sawPending) reconnectComplete.resolve();
+	} });
 	try {
 		assert.equal((await f.service.status()).allowBackgroundUse, true, "absent new setting ignores legacy per-account OFF");
 		await f.service.lease(true);
@@ -594,8 +607,9 @@ test("one app-wide background preference defaults ON over legacy OFF, persists w
 		await f.service.lease(false);
 		const id = f.saved.activeId;
 		await f.service.select(id); assert.equal((await f.service.status()).allowBackgroundUse, false);
-		await f.service.login(id); await f.callback();
-		for (let i = 0; i < 100 && (await f.service.status()).pending; i++) await new Promise((r) => setImmediate(r));
+		reconnectArmed = true;
+		await f.service.login(id); assert.equal(sawPending, true); await f.callback();
+		await reconnectComplete.promise;
 		assert.equal(f.saved.allowBackgroundUse, false, "reconnecting cannot overwrite app preference");
 		assert.equal(f.saved.registrations[0].background, undefined, "new verified registrations omit obsolete per-account preference");
 		await f.service.disconnect(f.saved.activeId);
@@ -604,7 +618,7 @@ test("one app-wide background preference defaults ON over legacy OFF, persists w
 		try {
 			assert.equal((await restarted.service.status()).allowBackgroundUse, false, "zero-account restart preserves global OFF");
 			await restarted.service.login(); await restarted.callback();
-			for (let i = 0; i < 100 && (await restarted.service.status()).pending; i++) await new Promise((r) => setImmediate(r));
+			await restarted.changed.promise;
 			assert.equal(restarted.saved.allowBackgroundUse, false);
 			await restarted.service.consent(true); assert.equal(restarted.saved.allowBackgroundUse, true);
 		} finally { restarted.service.close(); }
