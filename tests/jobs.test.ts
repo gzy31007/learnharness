@@ -62,8 +62,6 @@ import {
 	unregisterLiveAgent,
 } from "../src/server/jobs.ts";
 import { registerJobAbort, unregisterJobAbort } from "../src/agent/subagents/aborts.ts";
-import { getSubscriptionGeneration, withSubscriptionScope } from "../src/server/subscription.ts";
-import { SubscriptionError } from "../src/core/subscription.ts";
 import { beginTurn, endTurn } from "../src/server/turn-liveness.ts";
 import { persistTurn } from "../src/server/turn-service.ts";
 import { chatStore } from "../src/store/chats.ts";
@@ -348,8 +346,11 @@ describe("steer helpers (contracts.ts)", () => {
 			cacheReadTokens: 4,
 			cacheWriteTokens: undefined,
 			reasoningTokens: undefined,
+			cacheWrite1hTokens: undefined,
+			calls: [{ inputTokens: 10, outputTokens: 5, cacheReadTokens: 4, cacheWriteTokens: undefined, cacheWrite1hTokens: undefined, reasoningTokens: undefined }],
 			steps: 1,
 			lastStep: {
+				cacheWrite1hTokens: undefined,
 				inputTokens: 10,
 				outputTokens: 5,
 				cacheReadTokens: 4,
@@ -366,7 +367,9 @@ describe("steer helpers (contracts.ts)", () => {
 		assert.equal(total.cacheWriteTokens, undefined, "never reported stays absent — never zero");
 		assert.equal(total.reasoningTokens, undefined);
 		assert.equal(total.steps, 2, "one step per model call, reported or not");
+		assert.equal(total.calls?.length, 2);
 		assert.deepEqual(total.lastStep, {
+			cacheWrite1hTokens: undefined,
 			inputTokens: 20,
 			outputTokens: 0,
 			cacheReadTokens: undefined,
@@ -610,6 +613,43 @@ describe("research runner (async protocol §3)", () => {
 		// flip; the search line fired before it. The search itself ran on
 		// the INJECTED port — the stub saw the query (no network):
 		assert.deepEqual(search.queries, ["sigma.js latest version (5)"]);
+	});
+
+	it("a keyless fetch-only researcher still completes and delivers a sourced job result", async () => {
+		const url = "https://example.com/supplied-source";
+		const brief = `## Summary\nVerified supplied source. [Source](${url})\n\n## Sources\n- Source (${url})`;
+		const input = { question: `Verify ${url}` };
+		const chat = chatStore.createChat("Test: keyless fetch-only research");
+		trackChat(chat.id);
+		chatStore.saveMessages(chat.id, nativeToolMessages("verify supplied URL", "research", "call-keyless", input));
+		const job = jobStore.createJob({ kind: "research", chatId: chat.id, toolCallId: "call-keyless" });
+		trackJob(job.id);
+		const delivery = fakeDeliver();
+		const runner = createJobRunner({ chatStore, jobStore, deliver: delivery.deliver, searchProvider: () => null });
+		const fetched: string[] = [];
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (source) => {
+			fetched.push(String(source));
+			assert.equal(String(source), url);
+			return new Response("Synthetic verified source content", { headers: { "content-type": "text/plain" } });
+		}) as typeof fetch;
+		researchModelOverride.current = fauxEngine([
+			fauxAssistantMessage([fauxToolCall("web_fetch", { url }, { id: "keyless-fetch" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage([fauxText(brief)]),
+		]);
+		try {
+			await runner.runJob(job.id);
+		} finally {
+			researchModelOverride.current = undefined;
+			globalThis.fetch = realFetch;
+		}
+		assert.deepEqual(fetched, [url]);
+		const done = jobStore.getJob(job.id)!;
+		assert.equal(done.status, "done");
+		assert.equal((done.result as ResearchResult).brief, brief);
+		assert.ok((done.result as ResearchResult).sources.some((s) => s.url === url));
+		assert.equal(delivery.steers.length, 1);
+		assert.equal(isSubagentFailure("research", done.result as ResearchResult), false);
 	});
 
 	it("a failing runner still steers (the teacher learns the outcome) and the job lands error", async () => {
@@ -1777,152 +1817,5 @@ describe("composer steering: steerLiveChat + the deliver-or-requeue lifecycle", 
 		assert.deepEqual((next.handed[0] as { id: string }).id, "steer_s1");
 		unregisterLiveAgent(chatId);
 		reconcileUserSteers(chatId, [stranded, delivered] as never); // cleanup
-	});
-});
-
-// ─── subscription source provenance (issue #8) ──────────────────────────────
-
-describe("subscription source provenance (source-aware execution, issue #8)", () => {
-	function provenanceJob(subscriptionGeneration?: string): string {
-		const chat = chatStore.createChat("Test: subscription provenance");
-		trackChat(chat.id);
-		const job = jobStore.createJob({
-			kind: "research",
-			chatId: chat.id,
-			toolCallId: `call-sub-${Date.now().toString(36)}`,
-			...(subscriptionGeneration ? { subscriptionGeneration } : {}),
-		} as never);
-		trackJob(job.id);
-		return job.id;
-	}
-
-	function subscriptionEngine(): PiEngine {
-		const engine = researcherModel();
-		return { ...engine, model: { ...engine.model, provider: "openai-codex" } };
-	}
-
-	it("a job runs inside ITS recorded generation, never the caller's", async () => {
-		const jobId = provenanceJob("gen-old");
-		researchModelOverride.current = subscriptionEngine();
-		const scopes: Array<string | null | undefined> = [];
-		const runner = createJobRunner({
-			chatStore,
-			jobStore,
-			deliver: fakeDeliver().deliver,
-			scope: (<T,>(fn: () => Promise<T>, generation?: string | null) => {
-				scopes.push(generation);
-				return fn();
-			}) as never,
-			preflight: async () => ({ code: "subscription_needs_login" as const, message: "sign in" }),
-		});
-		await runner.runJob(jobId, RESEARCH_INPUT);
-		assert.deepEqual(scopes, ["gen-old"], "the job pins its own generation");
-		assert.match(jobStore.getJob(jobId)!.error ?? "", /subscription/i, "refused, not run on a fresher account");
-	});
-
-	it("a job with NO recorded generation gets an explicit empty scope — and a subscription source then refuses", async () => {
-		const jobId = provenanceJob();
-		researchModelOverride.current = subscriptionEngine();
-		const scopes: Array<string | null | undefined> = [];
-		const runner = createJobRunner({
-			chatStore,
-			jobStore,
-			deliver: fakeDeliver().deliver,
-			scope: (<T,>(fn: () => Promise<T>, generation?: string | null) => {
-				scopes.push(generation);
-				return fn();
-			}) as never,
-			preflight: async () => ({ code: "subscription_disconnected" as never, message: "disconnected" }),
-		});
-		await runner.runJob(jobId, RESEARCH_INPUT);
-		assert.deepEqual(scopes, [null], "explicit no-session — never a fresh capture");
-		assert.match(jobStore.getJob(jobId)!.error ?? "", /subscription/i, "old/unstamped work is not replayed");
-	});
-
-	it("a subscription engine that cannot even be BUILT (no session) refuses the job — never an unhandled crash", async () => {
-		const jobId = provenanceJob();
-		researchModelOverride.current = undefined;
-		const runner = createJobRunner({
-			chatStore,
-			jobStore,
-			deliver: fakeDeliver().deliver,
-			engineFor: () => {
-				throw new SubscriptionError("subscription_needs_login");
-			},
-		});
-		await runner.runJob(jobId, RESEARCH_INPUT);
-		assert.match(jobStore.getJob(jobId)!.error ?? "", /Sign in to this instance's Codex subscription/, "the typed refusal reaches the record");
-		assert.match(jobStore.getJob(jobId)!.error ?? "", /rather than run on a different model/, "and it is never swapped for a neighboring model");
-	});
-
-	it("an api-key job keeps the old path: preflight null → the loop runs", async () => {
-		const jobId = provenanceJob();
-		researchModelOverride.current = researcherModel();
-		const runner = createJobRunner({
-			chatStore,
-			jobStore,
-			deliver: fakeDeliver().deliver,
-			preflight: async () => null,
-		});
-		await runner.runJob(jobId, RESEARCH_INPUT);
-		assert.ok((jobStore.getJob(jobId)!.usage?.steps ?? 0) > 0, "the loop called the model");
-	});
-
-	it("the wake turn runs inside the steer's generation (explicit provenance, not the pump's)", async () => {
-		const chat = chatStore.createChat("Test: wake generation");
-		trackChat(chat.id);
-		chatStore.saveMessages(chat.id, [{ id: "u1", role: "user", content: "hi", timestamp: 1 } as never]);
-		const job = jobStore.createJob({
-			kind: "research",
-			chatId: chat.id,
-			toolCallId: "call-wake-gen",
-			subscriptionGeneration: "gen-old",
-		} as never);
-		trackJob(job.id);
-		const result: ResearchResult = { brief: "Done.", sources: [{ title: "s", url: "https://x.test" }] };
-		jobStore.updateJob(job.id, { result, activity: "delivering result" });
-		const steer = buildSubagentSteer(jobStore.getJob(job.id)!, result);
-		let seen: string | undefined | null = "unset";
-		setTurnRunner(async () => {
-			seen = getSubscriptionGeneration();
-			return 200;
-		});
-		await deliverJobResult(steer);
-		assert.equal(seen, "gen-old", "the wake carries the job's generation");
-	});
-
-	it("an old-generation steer never hands to a new-generation live agent", async () => {
-		const chat = chatStore.createChat("Test: stale steer vs live");
-		trackChat(chat.id);
-		chatStore.saveMessages(chat.id, [{ id: "u1", role: "user", content: "hi", timestamp: 1 } as never]);
-		const job = jobStore.createJob({
-			kind: "research",
-			chatId: chat.id,
-			toolCallId: "call-stale-live",
-			subscriptionGeneration: "gen-old",
-		} as never);
-		trackJob(job.id);
-		const result: ResearchResult = { brief: "Done.", sources: [{ title: "s", url: "https://x.test" }] };
-		jobStore.updateJob(job.id, { result, activity: "delivering result" });
-		const steer = buildSubagentSteer(jobStore.getJob(job.id)!, result);
-		const handed: SteerMessage[] = [];
-		const agent = { steer: (message: SteerMessage) => handed.push(message) };
-		let wakeGen: string | undefined | null = "unset";
-		setTurnRunner(async () => {
-			wakeGen = getSubscriptionGeneration();
-			return 200;
-		});
-
-		assert.ok(beginTurn(chat.id));
-		await withSubscriptionScope(async () => {
-			registerLiveAgent(chat.id, agent as never);
-		}, "gen-new");
-		const delivery = deliverJobResult(steer);
-		await delay(1200);
-		assert.equal(handed.length, 0, "never steered into a newer generation's run");
-		unregisterLiveAgent(chat.id);
-		endTurn(chat.id);
-		await delivery;
-		assert.equal(wakeGen, "gen-old", "delivered later, still under its own generation");
 	});
 });

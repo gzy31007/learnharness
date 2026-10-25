@@ -4,11 +4,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { ChatSettings, ModelCatalogEntry, ModelCatalogResponse, ModelsSettings, UserSettings } from "@/src/core";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { prettyModel } from "@/components/usage-format";
+import { isRetiredModelProvider, RETIRED_MODEL_MESSAGE } from "@/src/core/retired-model";
 import { ModelMenuList, ThinkingMenuList } from "@/components/settings/model-menu";
 import { composeSlotModel } from "@/components/settings/agent-section";
 import { MenuShell } from "@/components/menu-shell";
 import { Hint } from "@/components/ui/hint";
-import { notifySettingsSaved, useSettingsSaved } from "@/components/settings-signal";
+import { notifySettingsSaved, onSettingsSaved, useSettingsSaved } from "@/components/settings-signal";
 import { defaultOrderLevel, populateLevel, THINKING_LABEL } from "@/components/thinking-default";
 
 /** GET /api/models is cached per page load for instant menu opens, but
@@ -17,51 +18,40 @@ import { defaultOrderLevel, populateLevel, THINKING_LABEL } from "@/components/t
  *  every model-menu open (stale-while-revalidate: the cached list shows
  *  instantly, the fresh one swaps in while the menu is open). */
 let catalogCache: ModelCatalogResponse | undefined;
-let catalogInflight: Promise<ModelCatalogResponse> | undefined;
-
-function fetchCatalog(force = false): Promise<ModelCatalogResponse> {
-	if (force) {
-		catalogCache = undefined;
-		catalogInflight = undefined;
-	}
-	catalogInflight ??= fetch("/api/models")
-		.then((r) => {
-			if (!r.ok) throw new Error(`catalog request failed: ${r.status}`);
-			return r.json() as Promise<ModelCatalogResponse>;
-		})
-		.then((c) => {
-			catalogCache = c;
-			return c;
-		})
-		.catch((err) => {
-			catalogInflight = undefined; // retry on next mount/open
-			throw err;
-		});
-	return catalogInflight;
+let catalogInflight: Promise<void> | undefined;
+let catalogGeneration = 0;
+let stopCatalogSignals: (() => void) | undefined;
+const catalogReaders = new Set<() => void>();
+const publishCatalog = () => { for (const reader of catalogReaders) reader(); };
+function fetchCatalog(revalidate = false): void {
+	if (revalidate) { catalogGeneration++; catalogInflight = undefined; }
+	if (catalogInflight) return;
+	const generation = catalogGeneration;
+	catalogInflight = fetch("/api/models")
+		.then((r) => { if (!r.ok) throw new Error(`catalog request failed: ${r.status}`); return r.json() as Promise<ModelCatalogResponse>; })
+		.then((c) => { if (generation === catalogGeneration) { catalogCache = c; publishCatalog(); } })
+		.catch(() => { /* existing unavailable/usage-only posture, no retry timer */ })
+		.finally(() => { if (generation === catalogGeneration) catalogInflight = undefined; });
 }
-
 export function useModelCatalog(): { catalog: ModelCatalogResponse | undefined; refresh: () => void } {
 	const [catalog, setCatalog] = useState(catalogCache);
 	useEffect(() => {
-		if (catalogCache) return;
-		let alive = true;
-		fetchCatalog()
-			.then((c) => alive && setCatalog(c))
-			.catch(() => {
-				/* the picker stays closed on failure; the buttons still
-				   display the strong slot from the record fetch */
+		const first = catalogReaders.size === 0;
+		const read = () => setCatalog(catalogCache);
+		catalogReaders.add(read);
+		if (first) {
+			stopCatalogSignals = onSettingsSaved((section) => {
+				if (section === "keys") {
+					catalogGeneration++; catalogInflight = undefined; catalogCache = undefined;
+					publishCatalog(); fetchCatalog();
+				} else if (section === "models") fetchCatalog(true);
 			});
-		return () => {
-			alive = false;
-		};
+			fetchCatalog(true);
+		} else fetchCatalog();
+		read();
+		return () => { catalogReaders.delete(read); if (!catalogReaders.size) { stopCatalogSignals?.(); stopCatalogSignals = undefined; } };
 	}, []);
-	const refresh = useCallback(() => {
-		fetchCatalog(true)
-			.then(setCatalog)
-			.catch(() => {
-				/* refresh is best-effort: the cached list stays on failure */
-			});
-	}, []);
+	const refresh = useCallback(() => fetchCatalog(true), []);
 	return { catalog, refresh };
 }
 
@@ -92,7 +82,7 @@ export function catalogLimits(catalog: Pick<ModelCatalogResponse, "models">): Ma
  * changing the new-session default. Unpicked reads "—" (the
  * no-factory-fallback language: the UI never presents a default model).
  */
-export function ModelControl({ chatId }: { chatId?: string }) {
+export function ModelControl({ chatId, onModelChange }: { chatId?: string; onModelChange?: (model: string | undefined) => void }) {
 	const { catalog, refresh } = useModelCatalog();
 	const [models, setModels] = useState<ModelsSettings | undefined>();
 	const [session, setSession] = useState<ChatSettings | undefined>();
@@ -147,6 +137,10 @@ export function ModelControl({ chatId }: { chatId?: string }) {
 		: strong;
 	const effectiveId = override?.model?.id;
 	const effectiveProvider = override?.model?.provider;
+	const retired = isRetiredModelProvider(effectiveProvider);
+	useEffect(() => {
+		onModelChange?.(effectiveProvider && effectiveId ? `${effectiveProvider}:${effectiveId}` : undefined);
+	}, [effectiveProvider, effectiveId, onModelChange]);
 	const storedLevel = override?.thinkingLevel;
 	const entry = catalog?.models.find(
 		(m) => m.id === effectiveId && m.provider === effectiveProvider,
@@ -246,7 +240,6 @@ export function ModelControl({ chatId }: { chatId?: string }) {
 				const stored = (await res.json().catch(() => null)) as { settings?: ChatSettings } | null;
 				setSession(stored?.settings ?? next);
 				setOpen(null);
-				notifySettingsSaved("chat");
 			} catch {
 				setError("Could not reach the server — try again.");
 			}
@@ -357,6 +350,8 @@ export function ModelControl({ chatId }: { chatId?: string }) {
 				<button
 				type="button"
 				data-testid="stats-thinking"
+				disabled={retired}
+				title={retired ? "Re-select a model before changing thinking." : undefined}
 				onClick={() => {
 					// No model picked → nothing to set a level FOR: the click
 					// is a no-op, never an empty menu.
@@ -378,6 +373,12 @@ export function ModelControl({ chatId }: { chatId?: string }) {
 				<span aria-hidden className="text-xs text-muted-foreground">▾</span>
 			</button>
 			</Hint>
+
+			{retired && (
+				<span role="status" data-testid="model-retired-notice" title={RETIRED_MODEL_MESSAGE} className="text-xs text-destructive">
+					Re-select a model. The Codex connection is retired.
+				</span>
+			)}
 
 			{/* The shared dropdown body (extracted 2026-09-20): the agent
 			    settings' slot selects and the setup dialog use the exact same

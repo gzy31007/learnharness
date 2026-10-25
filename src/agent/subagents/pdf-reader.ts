@@ -1,10 +1,10 @@
+import { randomUUID } from "node:crypto";
 import type { AssistantMessage, Message, ToolResultMessage, Usage, Tool } from "@earendil-works/pi-ai";
 import { normalizeContext } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { piEngineFor, type PiEngine, type ThinkingLevel } from "../models.ts";
 import { providerEventObserver, type ProviderEventObserver } from "../provider-events.ts";
 import type { PdfResult, PdfToolInput } from "../../core/contracts.ts";
-import { messageUsagePresence, type UsagePresence } from "../../core/contracts/chat.ts";
 import { getHeadless, type HeadlessApi } from "./headless.ts";
 import { pdfExtract, pdfInfo, pdfProbe, pdfSearch, type PdfSearchHit } from "./pdf-ops.ts";
 
@@ -64,7 +64,7 @@ const EXTRACT_CAP = 24_000;
 export interface PdfReaderOptions {
 	engine?: PiEngine;
 	abortSignal?: AbortSignal;
-	onUsage?: (usage: Usage, presence: boolean | Partial<UsagePresence>) => void;
+	onUsage?: (usage: Usage) => void;
 	onActivity?: (line: string) => void;
 	headless?: HeadlessApi;
 	maxIterations?: number;
@@ -184,6 +184,7 @@ export async function runPdfReaderAgent(
 	// BYOK (owner, 2026-09-22): the level rides the injected engine — no
 	// factory pin to consult (engine.level is the resolved/clamped value).
 	const reasoning = engine.level;
+	const sessionId = randomUUID();
 	const prompt = [
 		`PDF path: ${pdfPath}`,
 		`Question (what the teacher needs from this document): ${input.question || "(no question — give a structural overview)"}`,
@@ -208,12 +209,13 @@ export async function runPdfReaderAgent(
 				INSTRUCTIONS,
 				messages,
 				toolDeclarations,
+				sessionId,
 				reasoning,
 				opts.abortSignal,
 				opts.chatId ? providerEventObserver(opts.chatId, "job:pdfReader") : undefined,
 			);
 			// Money channel: each iteration is one model call.
-			opts.onUsage?.(result.usage, messageUsagePresence(result));
+			opts.onUsage?.(result.usage);
 			messages = [...messages, result];
 
 			const toolCalls = result.content.filter(
@@ -396,6 +398,7 @@ async function streamOnce(
 	systemPrompt: string,
 	messages: Message[],
 	tools: Tool[],
+	sessionId: string,
 	reasoning: ThinkingLevel | undefined,
 	abortSignal?: AbortSignal,
 	onProviderStreamEvent?: ProviderEventObserver,
@@ -404,6 +407,7 @@ async function streamOnce(
 	// and tool declarations fold into a leading system message.
 	// normalizeContext is the library's only Context→TranscriptContext entry.
 	const stream = engine.streamFn(engine.model, normalizeContext({ systemPrompt, messages, tools }), {
+		sessionId,
 		reasoning: reasoning && reasoning !== "off" ? reasoning : undefined,
 		signal: abortSignal,
 		onProviderStreamEvent: onProviderStreamEvent as never,

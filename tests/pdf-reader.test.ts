@@ -157,11 +157,11 @@ describe("pdf-reader loop (faux engine)", () => {
 		assert.deepEqual(result.pagesRead, []);
 		assert.deepEqual(result.pagesConsulted, []);
 	});
-
-	it("never forces the OpenRouter key onto the engine's provider (subscription wave, issue #8)", async () => {
+	it("never injects a foreign provider credential into the engine's model calls", async () => {
 		// The engine's own provider resolves its credential. A leftover
-		// OPENROUTER_API_KEY in the process env must NOT ride along as an
-		// override: on a Codex-subscription pin it would be a foreign key.
+		// OPENROUTER_API_KEY in the process env must NOT ride along as a
+		// per-call override: on a differently-configured provider pin it would be
+		// a credential for the wrong provider.
 		const seen: Array<Record<string, unknown> | undefined> = [];
 		const inner = fauxEngine([
 			fauxAssistantMessage([fauxToolCall("pdf_info", {}, { id: "i1" })], { stopReason: "toolUse" }),

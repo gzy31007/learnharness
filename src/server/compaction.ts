@@ -45,7 +45,6 @@ import {
 	type LhMarkerMessage,
 } from "../core/index.ts";
 import { emit } from "../core/events.ts";
-import { callUsageOf, type UsagePresence } from "../core/contracts/chat.ts";
 import type { ChatStore } from "../core/ports.ts";
 import type { PiEngine } from "../agent/models.ts";
 import { runSubagent } from "../agent/subagents/pi-run.ts";
@@ -58,10 +57,10 @@ const SUMMARIZER_SYSTEM_PROMPT =
 /** The one-shot summary call: zero tools, one turn, text out. The engine
  *  is the chat's own conversation engine (owner ruling: the session's
  *  model writes its own summary). Injectable for tests. */
-export type Summarizer = (prompt: string, engine: PiEngine) => Promise<{ summary: string; usage: Usage; usagePresence?: boolean | Partial<UsagePresence> }>;
+export type Summarizer = (prompt: string, engine: PiEngine) => Promise<{ summary: string; usage: Usage }>;
 
 /** The production summarizer over the sub-agent seam. */
-async function subagentSummarizer(prompt: string, engine: PiEngine): Promise<{ summary: string; usage: Usage; usagePresence: boolean | Partial<UsagePresence> }> {
+async function subagentSummarizer(prompt: string, engine: PiEngine): Promise<{ summary: string; usage: Usage }> {
 	let usage: Usage = {
 		input: 0,
 		output: 0,
@@ -70,9 +69,6 @@ async function subagentSummarizer(prompt: string, engine: PiEngine): Promise<{ s
 		totalTokens: 0,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
-	/** Supplier usage presence (contracts/chat.ts) — a failed or truncated
-	 *  summary call reports nothing and must stay unknown, not $0. */
-	let usagePresence: boolean | Partial<UsagePresence> = false;
 	const { text } = await runSubagent([], {
 		// The engine override is always present (the chat's own conversation
 		// engine — owner ruling), so the role label never resolves an
@@ -83,17 +79,18 @@ async function subagentSummarizer(prompt: string, engine: PiEngine): Promise<{ s
 		engine,
 		systemPrompt: SUMMARIZER_SYSTEM_PROMPT,
 		maxTurns: 1,
-		onUsage: (u, presence) => {
+		onUsage: (u) => {
 			usage = u;
-			usagePresence = presence;
 		},
 	});
-	return { summary: text, usage, usagePresence };
+	return { summary: text, usage };
 }
 
 /** Everything the service needs from its host (chat-handler wires the
  *  production versions; tests inject). */
 export interface CompactionDeps {
+	/** Eligibility only for NEW runs; structural waits still apply. */
+	canStart?: () => boolean;
 	chatStore: ChatStore;
 	/** The chat's conversation engine — also the summarizer's. */
 	engine: PiEngine;
@@ -178,7 +175,7 @@ async function compact(deps: CompactionDeps, chatId: string): Promise<void> {
 	if (tokensBefore <= deps.thresholdTokens) return; // settled beneath while we waited
 
 	const cut = compactionCutIndex(messages);
-	if (cut >= messages.length) return; // nothing to drop (defensive)
+	if (cut <= 0 || cut >= messages.length) return; // no history can be dropped
 
 	// The previous compaction's kept boundary (chained compactions
 	// summarize the old summary + what rode after it).
@@ -216,7 +213,7 @@ async function compact(deps: CompactionDeps, chatId: string): Promise<void> {
 	emit("compaction-changed", { chatId, running: true });
 	try {
 		const summarize = deps.summarize ?? subagentSummarizer;
-		const { summary, usage, usagePresence = true } = await summarize(prompt, deps.engine);
+		const { summary, usage } = await summarize(prompt, deps.engine);
 		const trimmed = summary.trim();
 		if (!trimmed) return; // an empty summary is a refusal artifact — leave the record honest
 
@@ -237,7 +234,16 @@ async function compact(deps: CompactionDeps, chatId: string): Promise<void> {
 			messageId: marker.id,
 			at: details.at,
 			model: deps.modelId,
-			steps: [callUsageOf(usage, usagePresence)],
+			steps: [
+				{
+					inputTokens: usage.input,
+					outputTokens: usage.output,
+					cacheReadTokens: usage.cacheRead,
+					cacheWriteTokens: usage.cacheWrite,
+					cacheWrite1hTokens: usage.cacheWrite1h ?? 0,
+					reasoningTokens: usage.reasoning ?? 0,
+				},
+			],
 		});
 		// Notify-then-fetch: the record gained the marker (the client's
 		// dividers appear) and the status event ends the send gate.
@@ -264,6 +270,7 @@ export async function ensureCompacted(deps: CompactionDeps, chatId: string): Pro
 	// injected summarizer.
 	if (process.env.NODE_ENV === "test" && !deps.summarize) return;
 	await awaitCompaction(chatId);
+	if (deps.canStart?.() === false) return;
 	const record = deps.chatStore.getChat(chatId);
 	if (!record) return;
 	if (projectedContextTokens(record.messages, deps.systemPromptTokens) <= deps.thresholdTokens) return;
@@ -288,7 +295,7 @@ export async function ensureCompacted(deps: CompactionDeps, chatId: string): Pro
 export function kickCompaction(buildDeps: () => CompactionDeps | null, chatId: string): void {
 	if (state().inFlight.has(chatId)) return;
 	const deps = buildDeps();
-	if (!deps) return;
+	if (!deps || deps.canStart?.() === false) return;
 	const record = deps.chatStore.getChat(chatId);
 	if (!record) return;
 	if (projectedContextTokens(record.messages, deps.systemPromptTokens) <= deps.thresholdTokens) return;

@@ -4,7 +4,7 @@ import { invalidInputResult, questionResult } from "./tool-execute.ts";
 import { providerEventObserver } from "./provider-events.ts";
 import type { Usage } from "@earendil-works/pi-ai";
 import { PATHS } from "../../config.ts";
-import { piEngineFor, type PiEngine } from "./models.ts";
+import { APP_IDENTITY, piEngineFor, type PiEngine } from "./models.ts";
 import { effectivePromptSegments } from "./prompt-segments.ts";
 import {
 	askUserQuestionTool,
@@ -18,8 +18,9 @@ import { practiceTools, type PracticeToolContext } from "./tools/practice.ts";
 import { healToolRecord } from "./tools/heal.ts";
 import { quizInputObject, quizInputProblems } from "../core/question-core.ts";
 import { QUESTION_TOOLS, type EnabledTools } from "../core/pending.ts";
-import { toLlmMessages } from "../core/native-messages.ts";
-import { messageUsagePresence, type UsagePresence } from "../core/contracts/chat.ts";
+import { toLlmMessages, nativeInputCause } from "../core/native-messages.ts";
+import type { ChatGPTRequestCycle } from "./chatgpt-request-cycle.ts";
+import { usageWasAdmitted } from "./subscription-request-cycle.ts";
 
 /**
  * The two teaching-side agents (docs/probe-teach-split.md): the PROBER and
@@ -91,15 +92,15 @@ const composedInstructions: Record<AgentKind, string> = {
 
 // Money channel (wave 4): the chat-handler passes a per-turn collector;
 // every model call's usage lands in the chat record's turns log
-// (ChatStore.appendTurnUsage). The narrow params keep the seam honest:
-// `reported` is the supplier's usage presence (contracts/chat.ts), so the
-// collector can keep an unreported call unknown instead of a fake zero.
-export type StepUsageCollector = (usage: Usage, presence: boolean | Partial<UsagePresence>) => void;
+// (ChatStore.appendTurnUsage). The narrow param keeps the seam honest.
+export type StepUsageCollector = (usage: Usage) => void;
 
 /** Per-request construction options (the handler wires all of these). */
 export interface AgentBuildOptions {
 	/** Model + stream function — tests inject a scripted faux engine. */
 	engine?: PiEngine;
+	callPurpose?: { background: boolean };
+	requestCycle?: ChatGPTRequestCycle;
 	/** The initial transcript, as pi messages (the record IS agent state). */
 	messages?: AgentMessage[];
 	/** Money channel: one call per model request. */
@@ -119,7 +120,9 @@ export interface AgentBuildOptions {
 	 *  fresh per turn, honoring enabled overrides (switch on + file
 	 *  exists); absent → the cached pure-source composition. */
 	promptSwitches?: Record<string, boolean>;
-	/** Debug: when set AND LH_PROVIDER_EVENTS=1, raw provider stream events
+	/** Native conversation identity: the existing persisted chat id, reused
+	 * across reconstructed prober, teacher, and practice Agents.
+	 * Debug: when set AND LH_PROVIDER_EVENTS=1, raw provider stream events
 	 *  (pre-normalization) append to data/debug/provider-events/
 	 *  <chatId>.jsonl via providerEventObserver — the GLM-truncation /
 	 *  DeepSeek-id incident layer. Absent or env-off → no observer. */
@@ -179,7 +182,10 @@ function baseAgentOptions(kind: AgentKind, opts: AgentBuildOptions, tools: Agent
 	// LH_PROVIDER_EVENTS=1 and the caller handed a chatId; undefined is
 	// the normal no-observer path (tests, env-off).
 	const providerEvents = opts.chatId ? providerEventObserver(opts.chatId, kind) : undefined;
+	const seenInputs = new Set((opts.messages ?? []).map((m) => (m as { id?: string }).id).filter(Boolean));
 	const agent = new Agent({
+		identity: APP_IDENTITY,
+		sessionId: opts.chatId,
 		initialState: {
 			systemPrompt,
 			model: engine.model,
@@ -210,14 +216,32 @@ function baseAgentOptions(kind: AgentKind, opts: AgentBuildOptions, tools: Agent
 		// an abort's dangling question call gets its INTERRUPTED result. It
 		// must never throw (pi's convertToLlm contract).
 		convertToLlm: toLlmMessages,
+		prepareRequest: (request) => {
+			if (opts.callPurpose) {
+				let learner = false, automatic = false;
+				const messages = request.context.messages;
+				for (const message of messages) {
+					const id = (message as { id?: string }).id;
+					const cause = nativeInputCause(message, messages.slice(0, messages.indexOf(message)));
+					if (cause === "neutral") continue;
+					if (id && seenInputs.has(id)) continue;
+					if (id) seenInputs.add(id);
+					if (cause === "learner" && id) learner = true;
+					else automatic = true; // missing/unrecognized identity never grants foreground
+				}
+				if (automatic) opts.callPurpose.background = true;
+				else if (learner) opts.callPurpose.background = false;
+			}
+			opts.requestCycle?.prepare(request);
+		},
 	});
 	if (opts.onUsage) {
 		agent.subscribe((event: AgentEvent) => {
 			if (event.type === "message_end" && event.message.role === "assistant" && "usage" in event.message) {
 				// A cancelled call is not a billed step (partial/estimated
 				// usage on an aborted message is not money spent).
-				if (event.message.stopReason === "aborted") return;
-				opts.onUsage!(event.message.usage, messageUsagePresence(event.message));
+				if (event.message.stopReason === "aborted" || !usageWasAdmitted(event.message.usage) || (opts.requestCycle && !opts.requestCycle.acceptsUsage(event.message))) return;
+				opts.onUsage!(event.message.usage);
 			}
 		});
 	}

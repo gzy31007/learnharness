@@ -32,7 +32,7 @@ const {
 } = await import("../src/server/compaction.ts");
 import type { CompactionDeps } from "../src/server/compaction.ts";
 const { subscribe } = await import("../src/core/events.ts");
-const { activeCompactionOf, newUserMessage, COMPACTED_HISTORY_HEADER } = await import("../src/core/index.ts");
+const { activeCompactionOf, newUserMessage, measuredContextTokens, COMPACTED_HISTORY_HEADER } = await import("../src/core/index.ts");
 import type { LhMessage } from "../src/core/index.ts";
 
 after(() => {
@@ -74,6 +74,23 @@ const depsOf = (chatId: string, thresholdTokens: number): CompactionDeps => ({
 // ── the laws ────────────────────────────────────────────────────────────────
 
 describe("the compaction service", () => {
+	it("background eligibility skips both entrypoints without writes, but still awaits an existing structural run", async () => {
+		const chatId = overThresholdChat("compact: consent off");
+		const before = summarizeCalls;
+		const denied = { ...depsOf(chatId, 40_000), canStart: () => false };
+		await ensureCompacted(denied, chatId); kickCompaction(() => denied, chatId);
+		assert.equal(summarizeCalls, before);
+		assert.equal(activeCompactionOf(chatStore.getChat(chatId)!.messages), null);
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>((done) => { release = done; });
+		const started = new Promise<void>((done) => { entered = done; });
+		const allowed = { ...depsOf(chatId, 40_000), summarize: async (prompt: string) => { entered(); await gate; return depsOf(chatId, 40_000).summarize!(prompt, denied.engine); } };
+		kickCompaction(() => allowed, chatId); await started;
+		let finished = false;
+		const waiter = ensureCompacted(denied, chatId).then(() => { finished = true; });
+		await Promise.resolve(); assert.equal(finished, false);
+		release(); await waiter; assert.equal(finished, true);
+	});
 	it("over-threshold record → marker appended, usage logged, both events emitted", async () => {
 		const chatId = overThresholdChat("compact: basic");
 		const events: string[] = [];
@@ -97,33 +114,6 @@ describe("the compaction service", () => {
 		assert.ok((record.turns ?? []).some((t) => t.messageId === marker!.id && t.model === "faux:test"), "usage keyed by the marker");
 		// events: running true → record-changed → running false
 		assert.deepEqual(events, ["true", "record", "false"]);
-	});
-
-	it("an UNREPORTED summary call logs unknown usage, never a priced zero", async () => {
-		// A summarizer that failed or was cut off reports no usage at all —
-		// the fixture's seeded zeros are not a billed zero (subscription
-		// usage-presence wave). The turn must fold to unknown, not $0.
-		const chatId = overThresholdChat("compact: unreported usage");
-		const deps: CompactionDeps = {
-			...depsOf(chatId, 40_000),
-			summarize: async () => ({
-				summary: "PARTIAL SUMMARY.",
-				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-				usagePresence: false,
-			}),
-		};
-		await ensureCompacted(deps, chatId);
-		const record = chatStore.getChat(chatId)!;
-		const marker = activeCompactionOf(record.messages);
-		assert.ok(marker, "the marker landed");
-		const turn = (record.turns ?? []).find((t) => t.messageId === marker!.id);
-		assert.ok(turn, "usage keyed by the marker");
-		assert.equal(turn!.steps[0]!.inputTokens, undefined, "unreported input stays unknown");
-		assert.equal(turn!.steps[0]!.outputTokens, undefined, "unreported output stays unknown");
-		const { turnEstimate } = await import("../src/core/prices.ts");
-		const estimate = turnEstimate(turn);
-		assert.equal(estimate.dollars, null, "no fake $0");
-		assert.equal(estimate.coverage, "unknown");
 	});
 
 	it("under-threshold record → a no-op (no marker, no summary call)", async () => {
@@ -212,6 +202,37 @@ describe("the compaction service", () => {
 		assert.equal(summarizeCalls, afterFirst, "post-compaction record is under threshold — no run");
 		// a null deps build (engineless) is a silent no-op
 		kickCompaction(() => null, chatId);
+	});
+
+	it("a usage-heavy zero cut does not spend or append a marker", async () => {
+		const chat = chatStore.createChat("no-progress fixture");
+		const assistant = { id: "measured", role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop", usage: { input: 120_000, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 120_001 }, timestamp: 1 } as LhMessage;
+		chatStore.saveMessages(chat.id, [newUserMessage("tiny visible history"), assistant]);
+		const before = summarizeCalls;
+		await ensureCompacted(depsOf(chat.id, 40_000), chat.id);
+		assert.equal(summarizeCalls, before);
+		assert.equal(activeCompactionOf(chatStore.getChat(chat.id)!.messages), null);
+		assert.equal(measuredContextTokens(chatStore.getChat(chat.id)!.messages), 120_001);
+	});
+
+	it("starting/failing compaction preserves the meter; committing its marker clears it, regardless of summary usage", async () => {
+		const id = overThresholdChat("meter validity fixture");
+		const assistant = { id: "measured", role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop", usage: { input: 120_000, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 120_001 }, timestamp: 1 } as LhMessage;
+		chatStore.saveMessages(id, [...chatStore.getChat(id)!.messages, assistant]);
+		let release!: () => void;
+		const gate = new Promise<void>((done) => { release = done; });
+		const deps = depsOf(id, 40_000);
+		const running = ensureCompacted({ ...deps, summarize: async () => {
+			await gate;
+			throw new Error("fixture failure");
+		} }, id);
+		assert.equal(measuredContextTokens(chatStore.getChat(id)!.messages), 120_001);
+		release(); await running;
+		assert.equal(measuredContextTokens(chatStore.getChat(id)!.messages), 120_001);
+		await ensureCompacted(deps, id);
+		const record = chatStore.getChat(id)!;
+		assert.ok(record.turns!.at(-1)!.steps[0]!.inputTokens! > 0);
+		assert.equal(measuredContextTokens(record.messages), null);
 	});
 
 	it("a summarizer failure leaves the record untouched and the gate re-arms", async () => {

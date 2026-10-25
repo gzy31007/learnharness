@@ -64,11 +64,13 @@ import {
 	type SteerMessage,
 } from "../core/contracts.ts";
 import type { TurnInput } from "../core/input-events.ts";
+import { isRetiredModelProvider, RETIRED_MODEL_MESSAGE } from "../core/retired-model.ts";
 import { danglingQuestionOf, endsInDismissal, type LhMessage } from "../core/native-messages.ts";
 import { fireJobAbort, isJobLive } from "../agent/subagents/aborts.ts";
-import { stores } from "./stores.ts";
+import { stores, effectiveSettings } from "./stores.ts";
+import { resolveConversationSpec } from "../core/settings-resolution.ts";
+import { connectionBackgroundAllowed, isSubscriptionProvider, onSubscriptionChange } from "../agent/subscription-connections.ts";
 import { isTurnRunning } from "./turn-liveness.ts";
-import { getSubscriptionGeneration, withSubscriptionScope } from "./subscription.ts";
 import type { Agent } from "@earendil-works/pi-agent-core";
 
 /** Fires one server-side teacher turn: (chatId, input) → HTTP-ish status.
@@ -89,25 +91,6 @@ interface QueuedSteer {
 	 *  re-registered run must not re-queue what a run already holds) and is
 	 *  CLEARED at settlement for markers the dying run never injected. */
 	handedTo?: Agent;
-	/** The subscription generation this steer was produced under
-	 *  (source-aware execution, issue #8) — read off the job's result meta
-	 *  when it was queued. Absent = no subscription session: a wake for it
-	 *  runs with an explicit empty scope, never a fresh capture. */
-	subscriptionGeneration?: string;
-}
-
-/** One streaming turn's agent plus the subscription generation its run was
- *  captured under (issue #8). Steers only ride a run of their OWN
- *  generation: an old result must never continue on a newer account. */
-interface LiveAgent {
-	agent: Agent;
-	subscriptionGeneration?: string;
-}
-
-/** The subscription generation a marker was produced under (issue #8). */
-function steerGeneration(steer: SteerMessage): string | undefined {
-	const details = (steer as { details?: { subscriptionGeneration?: unknown } }).details;
-	return typeof details?.subscriptionGeneration === "string" ? details.subscriptionGeneration : undefined;
 }
 
 interface WakeState {
@@ -126,11 +109,13 @@ interface WakeState {
 	/** chatId → the agent of the CURRENTLY streaming turn (cleared at
 	 *  settlement, before settleSteers). The pump's live path hands
 	 *  markers to this agent's follow-up queue. */
-	liveAgents: Map<string, LiveAgent>;
+	liveAgents: Map<string, Agent>;
 	/** Chats whose pump loop is currently active (serialization per chat). */
 	pumping: Set<string>;
 	/** Throttle bookkeeping for the stale-job sweep. */
 	lastSweepAt: number;
+	stopConnectionWatch?: () => void;
+	automaticDeferred: WeakSet<Agent>;
 }
 
 interface LhWakeGlobal {
@@ -139,7 +124,7 @@ interface LhWakeGlobal {
 
 function state(): WakeState {
 	const g = globalThis as typeof globalThis & LhWakeGlobal;
-	return (g.__lhWakePipeline ??= { queues: new Map(), liveAgents: new Map(), userSteers: new Map(), pumping: new Set(), lastSweepAt: 0 });
+	return (g.__lhWakePipeline ??= { queues: new Map(), liveAgents: new Map(), userSteers: new Map(), pumping: new Set(), lastSweepAt: 0, automaticDeferred: new WeakSet() });
 }
 
 /** chat-handler wires this at module init: its adapter around handleChatRequest. */
@@ -216,7 +201,7 @@ export function deliverJobResult(steer: SteerMessage): Promise<void> {
 		const s = state();
 		const chatId = chatIdOf(steer);
 		const queue = s.queues.get(chatId) ?? [];
-		queue.push({ steer, resolve, reject, subscriptionGeneration: steerGeneration(steer) });
+		queue.push({ steer, resolve, reject });
 		s.queues.set(chatId, queue);
 		void pump(chatId);
 	});
@@ -230,23 +215,20 @@ export function deliverJobResult(steer: SteerMessage): Promise<void> {
  *  beats the loop's synchronous start-poll drain and the marker rides the
  *  run's FIRST LLM call (the native equivalent of the old continuation
  *  coalescing). */
-function handOffEligible(chatId: string, live: LiveAgent): void {
-	const agent = live.agent;
+export function automaticFollowUpAllowed(chatId: string, agent?: Agent): boolean {
+	if (agent && state().automaticDeferred.has(agent)) return false;
+	const provider = agent?.state?.model?.provider ?? resolveConversationSpec(stores.chatStore.getChat(chatId)?.settings, effectiveSettings().models.strong)?.provider;
+	return connectionBackgroundAllowed(provider);
+}
+
+function handOffEligible(chatId: string, agent: Agent): void {
 	const queue = state().queues.get(chatId);
-	if (queue && queue.length > 0) {
+	// Keep automatic results in their owning registry. Never mix them into a
+	// foreground batch without express account consent. Learner steers below
+	// remain deliverable, including the first poll of an answer run.
+	if (automaticFollowUpAllowed(chatId, agent) && queue && queue.length > 0) {
 		for (const entry of queue) {
-			if (
-				entry.handedTo !== agent &&
-				entry.steer.customType !== "probe-handoff" &&
-				// Same generation only (issue #8): an old subscription result
-				// stays parked for its own wake instead of continuing a newer
-				// account's run. A steer with NO provenance is not subscription
-				// work (subscription jobs are stamped at spawn; unstamped ones
-				// are refused by the source preflight, never run) — it may ride
-				// any live run, as before.
-				(entry.subscriptionGeneration === undefined ||
-					entry.subscriptionGeneration === live.subscriptionGeneration)
-			) {
+			if (entry.handedTo !== agent && entry.steer.customType !== "probe-handoff") {
 				agent.steer(entry.steer);
 				entry.handedTo = agent;
 			}
@@ -273,10 +255,9 @@ function handOffEligible(chatId: string, live: LiveAgent): void {
  *  markers are steered into the run right here. The settle seam cannot
  *  beat the registration: settlement needs a streamed response, which
  *  never happens inside the constructor call. */
-export function registerLiveAgent(chatId: string, agent: Agent, subscriptionGeneration?: string): void {
-	const s = state();
-	s.liveAgents.set(chatId, { agent, subscriptionGeneration: subscriptionGeneration ?? getSubscriptionGeneration() });
-	handOffEligible(chatId, s.liveAgents.get(chatId)!);
+export function registerLiveAgent(chatId: string, agent: Agent): void {
+	state().liveAgents.set(chatId, agent);
+	handOffEligible(chatId, agent);
 }
 
 /** A parked user steer: the message plus the agent it was last handed to
@@ -296,9 +277,8 @@ export interface UserSteerEntry {
  *  termination, abort), reconcileUserSteers keeps it parked for the
  *  chat's next run. */
 export function steerLiveChat(chatId: string, message: LhMessage): boolean {
-	const live = state().liveAgents.get(chatId);
-	if (!live) return false;
-	const agent = live.agent;
+	const agent = state().liveAgents.get(chatId);
+	if (!agent) return false;
 	const entry: UserSteerEntry = { message };
 	const q = state().userSteers.get(chatId) ?? [];
 	q.push(entry);
@@ -324,7 +304,23 @@ export function reconcileUserSteers(chatId: string, persisted: readonly LhMessag
 /** Clear the live agent at settlement — MUST run before settleSteers so the
  *  reconciliation's re-pump can never hand a marker to the dying agent. */
 export function unregisterLiveAgent(chatId: string): void {
+	const agent = state().liveAgents.get(chatId);
+	if (agent) state().automaticDeferred.delete(agent);
 	state().liveAgents.delete(chatId);
+}
+
+/** Restore exact registry objects after native drain but before dispatch.
+ * The vehicle is disposable; result ownership/promises are not. */
+export function restoreUncommittedAutomatic(chatId: string, agent: Agent, automaticIds: ReadonlySet<string>, retainedIds: ReadonlySet<string>): void {
+	const s = state();
+	s.automaticDeferred.add(agent);
+	for (const entry of s.queues.get(chatId) ?? []) {
+		if (entry.handedTo === agent && automaticIds.has(entry.steer.id)) entry.handedTo = undefined;
+	}
+	agent.clearSteeringQueue();
+	for (const entry of s.userSteers.get(chatId) ?? []) {
+		if (!retainedIds.has(entry.message.id)) { agent.steer(entry.message); entry.handedTo = agent; }
+	}
 }
 
 /** TURN SETTLEMENT RECONCILIATION (Wave C): the handler calls this AFTER
@@ -453,6 +449,7 @@ async function pump(chatId: string): Promise<void> {
 	const s = state();
 	if (s.pumping.has(chatId)) return;
 	s.pumping.add(chatId);
+	let parked = false;
 	try {
 		for (let attempt = 0; ; ) {
 			const queue = s.queues.get(chatId);
@@ -486,6 +483,7 @@ async function pump(chatId: string): Promise<void> {
 				return;
 			}
 			s.queues.set(chatId, stillPending);
+			if (!automaticFollowUpAllowed(chatId, s.liveAgents.get(chatId))) { parked = true; return; }
 
 			// VEHICLE 1 — THE LIVE RUN: pi's steering queue. The agent of the
 			// streaming turn takes every eligible marker; pi injects at the
@@ -496,7 +494,7 @@ async function pump(chatId: string): Promise<void> {
 			const live = s.liveAgents.get(chatId);
 			if (live && isTurnRunning(chatId)) {
 				handOffEligible(chatId, live);
-				const handable = stillPending.filter((e) => e.handedTo === live.agent);
+				const handable = stillPending.filter((e) => e.handedTo === live);
 				// probe-handoffs never ride a live run (owner ruling: the
 				// handoff must START the teacher's run) — if any remain
 				// pending, wait the run out and loop to the wake below.
@@ -559,7 +557,8 @@ async function pump(chatId: string): Promise<void> {
 			// hands them to that turn once the text-claim lands — until then,
 			// settlement re-pumps and lands them right after it). The pause is
 			// derived from the tail, so any user message un-holds by construction.
-			if (endsInDismissal(fresh.messages)) {
+			if (endsInDismissal(fresh.messages) || !automaticFollowUpAllowed(chatId)) {
+				parked = true;
 				return;
 			}
 
@@ -567,28 +566,29 @@ async function pump(chatId: string): Promise<void> {
 			// the carried markers leave the registry BEFORE the turn runs —
 			// the wake run's OWN follow-up poll must never see its own cargo,
 			// and a 409 (client raced in) must be able to push them back.
-			// ONE wake turn = ONE subscription generation (issue #8). Fire the
-			// earliest cohort now; other generations stay queued for their own
-			// wakes — mixing would run old results on a newer account.
-			const generation = fire[0]!.subscriptionGeneration;
-			const cohort = fire.filter((e) => e.subscriptionGeneration === generation);
-			const rest = fire.filter((e) => e.subscriptionGeneration !== generation);
 			s.queues.delete(chatId);
-			if (rest.length > 0) s.queues.set(chatId, rest);
-			const steers = cohort.map((e) => e.steer);
+			const steers = fire.map((e) => e.steer);
 
 			// Fire the wake (every marker as the turn's input appends). A 409 =
 			// a client turn raced in between idle and firing — push the cargo
 			// back and retry after backoff (the racing turn's own settlement
 			// re-pumps if it beats us to the re-queue).
-			const runWake = () => s.turnRunner!(chatId, { type: "steers", steers });
-			const status = await withSubscriptionScope(runWake, generation ?? null).catch((err: unknown) => {
+			const status = await s.turnRunner(chatId, { type: "steers", steers }).catch((err: unknown) => {
 				console.error(`[steer ${steers.map((x) => x.id).join(",")}] wake turn crashed:`, err);
 				return -1;
 			});
+			if (status === 403) {
+				// Consent may have changed after the last gate. Preserve completed
+				// job/result ownership and wait for an explicit connection change.
+				const back = s.queues.get(chatId) ?? [];
+				back.push(...fire);
+				s.queues.set(chatId, back);
+				parked = true;
+				return;
+			}
 			if (status === 409) {
 				const back = s.queues.get(chatId) ?? [];
-				back.push(...cohort);
+				back.push(...fire);
 				s.queues.set(chatId, back);
 				await delay(RETRY_BACKOFF_MS[Math.min(attempt++, RETRY_BACKOFF_MS.length - 1)]!);
 				continue;
@@ -596,13 +596,13 @@ async function pump(chatId: string): Promise<void> {
 			attempt = 0;
 
 			if (status === 200) {
-				for (const entry of cohort) {
+				for (const entry of fire) {
 					finalizeSteer(entry.steer);
 					entry.resolve();
 				}
 			} else {
 				const err = new Error(`wake turn failed with status ${status}`);
-				for (const entry of cohort) {
+				for (const entry of fire) {
 					failSteer(entry.steer, err);
 					entry.reject(err);
 				}
@@ -615,9 +615,29 @@ async function pump(chatId: string): Promise<void> {
 		// a live run are NOT stragglers (settleSteers owns their resurrection)
 		// — restarting for them would just park in waitForIdle forever.
 		const q = state().queues.get(chatId) ?? [];
-		if (q.some((e) => e.handedTo === undefined)) void pump(chatId);
+		if (!parked && automaticFollowUpAllowed(chatId, state().liveAgents.get(chatId)) && q.some((e) => e.handedTo === undefined)) void pump(chatId);
 	}
 }
+
+// Connection changes are the only wake for consent-deferred automatic work.
+// No retry timer, inference, or API-key fallback is started while consent is off.
+state().stopConnectionWatch?.();
+state().stopConnectionWatch = onSubscriptionChange(() => {
+	const s = state();
+	for (const [chatId, agent] of s.liveAgents) {
+		if (!isSubscriptionProvider(agent.state?.model?.provider) || automaticFollowUpAllowed(chatId, agent)) continue;
+		const consumed = new Set(agent.state.messages.map((m) => (m as { id?: string }).id));
+		const pending = (s.queues.get(chatId) ?? []).filter((entry) => entry.handedTo === agent && !consumed.has(entry.steer.id));
+		if (pending.length === 0) continue;
+		agent.clearSteeringQueue();
+		for (const entry of pending) entry.handedTo = undefined;
+		for (const entry of s.userSteers.get(chatId) ?? []) if (!consumed.has(entry.message.id)) entry.handedTo = undefined;
+		handOffEligible(chatId, agent); // only unconsumed learner input; never replay consumed steers
+	}
+	for (const chatId of s.queues.keys()) {
+		if (automaticFollowUpAllowed(chatId, s.liveAgents.get(chatId))) void pump(chatId);
+	}
+});
 
 /** Flip the job to its final status now that the lesson has resumed. */
 function finalizeJob(jobId: string): void {
@@ -696,7 +716,14 @@ export function recoverStaleJobs(): void {
 			for (const job of stores.jobStore.listJobs(chat.id)) {
 				if (job.status !== "running") continue;
 				if (isJobLive(job.id)) continue; // provably executing here — never re-run beside it
-				if (!stores.chatStore.getChat(job.chatId)) continue;
+				const record = stores.chatStore.getChat(job.chatId);
+				if (!record) continue;
+				const provider = resolveConversationSpec(record.settings, effectiveSettings().models.strong)?.provider;
+				// Old authorization stamps cannot be translated into desktop connection authority.
+				if (Object.hasOwn(job, "subscriptionGeneration") || isRetiredModelProvider(provider)) {
+					stores.jobStore.updateJob(job.id, { status: "error", activity: "Model re-selection required", error: RETIRED_MODEL_MESSAGE });
+					continue;
+				}
 				if (isTurnRunning(job.chatId)) continue; // a wake turn may be delivering it right now
 				if (job.result) {
 					// The wake never fired (or crashed mid-flight): re-deliver.

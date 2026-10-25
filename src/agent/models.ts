@@ -11,7 +11,20 @@ import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { type ModelRole } from "../../config.ts";
 import { DEFAULT_THINKING_ORDER } from "../core/settings.ts";
-import { SUBSCRIPTION_PROVIDER, SubscriptionError } from "../core/subscription.ts";
+import { isRetiredModelProvider, RETIRED_MODEL_MESSAGE } from "../core/retired-model.ts";
+import packageMetadata from "../../package.json" with { type: "json" };
+import { chatGPTModel } from "./chatgpt-bridge.ts";
+import { chatGPTStream } from "./chatgpt-stream.ts";
+import type { ChatGPTDispatchLifecycle } from "./chatgpt-request-cycle.ts";
+import { nativeSubscriptionId, nativeSubscriptionModel } from "./subscription-bridge.ts";
+import { nativeSubscriptionStream } from "./subscription-stream.ts";
+
+/** App identity is immutable and shared by Models and every native Agent.
+ * Agent's default Pi attribution otherwise overrides the Models identity. */
+export const APP_IDENTITY = Object.freeze({
+	userAgent: Object.freeze({ custom: `learnharness/${packageMetadata.version}` }),
+	attribution: Object.freeze({ name: packageMetadata.name, url: packageMetadata.homepage }),
+});
 
 /**
  * The one engine factory every agent's model comes from (the pi-ai swap,
@@ -48,7 +61,7 @@ let collection: ReturnType<typeof createModels> | undefined;
  *  keyPresent. */
 export function piModels() {
 	if (!collection) {
-		collection = createModels();
+		collection = createModels({ identity: APP_IDENTITY });
 		for (const provider of builtinProviders()) collection.setProvider(provider);
 	}
 	return collection;
@@ -86,16 +99,11 @@ function defaultThinkingLevel(model: Model<Api>): ThinkingLevel {
  *  key is resolved by pi-ai itself from the environment per request (the
  *  keys seam reflects file-saved keys into env), so the engine never
  *  hardcodes OpenRouter's. */
-export function piEngineForSpec(spec: ResolvedModelSpec): PiEngine {
-	// Subscription execution must be composed by the server with a durable
-	// generation-bound credential store and protected transport.
-	if (spec.provider === SUBSCRIPTION_PROVIDER) throw new SubscriptionError("subscription_needs_login");
-	return engineForCollection(spec, piModels());
-}
-
-/** Dependency-injected catalog/engine builder. It never reads server state. */
-export function engineForCollection(spec: ResolvedModelSpec, models: Models): PiEngine {
-	const model = models.getModel(spec.provider, spec.id);
+export function piEngineForSpec(spec: ResolvedModelSpec, background: boolean | (() => boolean) = true, lifecycle?: ChatGPTDispatchLifecycle): PiEngine {
+	if (isRetiredModelProvider(spec.provider)) throw new Error(RETIRED_MODEL_MESSAGE);
+	const models: Models = piModels();
+	const nativeId = nativeSubscriptionId(spec.provider);
+	const model = spec.provider === "chatgpt" ? chatGPTModel(spec.id) : nativeId ? nativeSubscriptionModel(spec.provider, spec.id) : models.getModel(spec.provider, spec.id);
 	if (!model) {
 		throw new Error(`${spec.provider} catalog has no model ${spec.id}`);
 	}
@@ -111,11 +119,11 @@ export function engineForCollection(spec: ResolvedModelSpec, models: Models): Pi
 		// bound streamSimple: the agent loop forwards state.thinkingLevel as
 		// `reasoning` (undefined = off on pi-ai's scale); the clamp above keeps
 		// the pin honest even when config or settings drift off the map.
-		streamFn: (requestModel, context, options) =>
-			models.streamSimple(requestModel, context, {
-				...options,
-				reasoning: level === "off" ? undefined : level,
-			}),
+		streamFn: (requestModel, context, options) => {
+			const purpose = typeof background === "function" ? background : () => background;
+			const stream = spec.provider === "chatgpt" ? chatGPTStream(purpose, lifecycle) : nativeId ? nativeSubscriptionStream(models.getProvider(nativeId)!, purpose, lifecycle) : models.streamSimple.bind(models);
+			return stream(requestModel, context, { ...options, reasoning: level === "off" ? undefined : level });
+		},
 	};
 }
 

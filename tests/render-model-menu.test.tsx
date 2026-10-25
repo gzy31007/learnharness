@@ -9,8 +9,8 @@ import type { ModelCatalogEntry } from "../src/core/contracts.ts";
 
 /**
  * The model menu's price is a catalog RATE (USD per 1M tokens in/out), not a
- * bill. Its tooltip must connect that rate to the estimated model cost the
- * rest of the observability surfaces show, without implying a charge.
+ * bill. The menu labels that rate with its unit and shows the model's in/out
+ * price, so the number is never mistaken for a charge.
  */
 describe("ModelMenuList price tooltip", () => {
 	const model: ModelCatalogEntry = {
@@ -25,11 +25,11 @@ describe("ModelMenuList price tooltip", () => {
 		supportedLevels: [],
 	};
 
-	it("names the estimated model cost and keeps the rate framing", () => {
+	it("labels the catalog rate as USD per 1M tokens and shows the in/out price", () => {
 		const html = renderToStaticMarkup(
 			<ModelMenuList models={[model]} effectiveId={undefined} onPick={() => {}} />,
 		);
-		assert.match(html, /title="Estimated model cost basis: catalog list price, USD per 1M tokens in\/out; not a bill"/);
+		assert.match(html, /title="USD per 1M tokens in\/out"/);
 		assert.match(html, /\$0\.15\/\$0\.5/);
 	});
 });
