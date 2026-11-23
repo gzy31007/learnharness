@@ -435,3 +435,56 @@ describe("desktop release workflow", () => {
 		]), /Multiple releases match/);
 	});
 });
+
+/** The desktop shell hands the backend one explicit proxy setting; the child
+ *  only honours it because NODE_USE_ENV_PROXY is set at spawn time. Boot the
+ *  real main.cjs far enough to call proxyEnv() — no Electron, no server. */
+function proxyEnvFor(env: Record<string, string>): Record<string, string> {
+	class FakeWindow {
+		static getAllWindows() { return []; }
+		webContents = { on() {}, setWindowOpenHandler() {} };
+		loadURL() {}
+		once() {}
+	}
+	const electron = {
+		app: { setName() {}, getPath: () => "/fixture/LearnHarness", setPath() {}, requestSingleInstanceLock: () => false, quit() {} },
+		BrowserWindow: FakeWindow,
+		nativeTheme: { shouldUseDarkColors: true, themeSource: "system", on() {} },
+		Menu: { buildFromTemplate() {}, setApplicationMenu() {} },
+		ipcMain: { handle() {}, on() {} },
+		session: { defaultSession: { setPermissionRequestHandler() {}, setPermissionCheckHandler() {} } },
+	};
+	const context = {
+		require: (id: string) => id === "electron" ? electron : mainRequire(id),
+		process: { platform: "win32", argv: [], env, on() {} },
+		__dirname: dirname(mainFile),
+	};
+	runInNewContext(mainSource, context, { filename: mainFile });
+	return JSON.parse(JSON.stringify(runInNewContext("proxyEnv()", context)));
+}
+
+describe("desktop model-request proxy", () => {
+	it("turns LH_PROXY_URL into the env Node's fetch needs", () => {
+		const env = proxyEnvFor({ LH_PROXY_URL: "http://127.0.0.1:17891" });
+		assert.equal(env.NODE_USE_ENV_PROXY, "1");
+		for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]) {
+			assert.equal(env[key], "http://127.0.0.1:17891", key);
+		}
+		assert.match(env.NO_PROXY, /localhost/);
+		assert.match(env.NO_PROXY, /127\.0\.0\.1/);
+	});
+
+	it("reuses an already-exported https_proxy and keeps the caller's NO_PROXY", () => {
+		const env = proxyEnvFor({ https_proxy: "http://10.0.0.2:8080", NO_PROXY: "corp.example" });
+		assert.equal(env.HTTPS_PROXY, "http://10.0.0.2:8080");
+		assert.match(env.NO_PROXY, /^corp\.example,/);
+	});
+
+	it("defaults to the local mixed proxy when nothing is configured", () => {
+		assert.equal(proxyEnvFor({}).HTTPS_PROXY, "http://127.0.0.1:17891");
+	});
+
+	it("can be switched off for a machine without that proxy", () => {
+		assert.deepEqual(proxyEnvFor({ LH_PROXY_URL: "off" }), {});
+	});
+});

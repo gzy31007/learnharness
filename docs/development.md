@@ -55,6 +55,11 @@ Nonsecret settings are deltas in `<data root>/settings.json`; absent values reso
 | `DEEPGRAM_API_KEY` | Optional dictation token minting. |
 | `CHROME_PATH` | Chrome/Chromium executable fallback for demo verification; Electron's browser helper is primary. No extra Chromium is downloaded. |
 | `LH_ALLOWED_HOSTS` | Browser-only mode: extra host names the API accepts besides `localhost` and IP addresses. Comma-separated, case-insensitive, port ignored, no wildcards. |
+| `LH_PROXY_URL` | Desktop shell only: HTTP proxy for the backend's model requests. Falls back to an exported `HTTPS_PROXY`/`https_proxy`, then to `http://127.0.0.1:17891` in this build. `off` disables it. |
+
+### Model-request proxy (desktop)
+
+The desktop shell spawns the backend as a plain Node process, and Node only honours `HTTP(S)_PROXY` when `NODE_USE_ENV_PROXY=1` is present at startup — a packaged app normally inherits no proxy at all. The shell therefore sets that flag plus both cases of `HTTP_PROXY`/`HTTPS_PROXY` (and `NO_PROXY` for loopback) from `LH_PROXY_URL`, so every provider SDK, including Google's, leaves through the same proxy. `LH_PROXY_URL=off` skips the injection. Point it at an HTTP or mixed port: Node's built-in `fetch` ignores `all_proxy=socks5`.
 
 Ordinary Next development can read `.env.local`. Real environment keys take precedence over saved keys. Saved auth is restrictive-permission plaintext, not an encrypted vault. Packaged Electron sets separate data/auth locations under `userData`; it does not use the repo development profile.
 

@@ -211,8 +211,47 @@ function log(line) {
 	}
 }
 
+/** Proxy for the backend's model requests (desktop only).
+ *
+ *  The desktop shell spawns the backend as a plain Node process; Node reads
+ *  HTTP(S)_PROXY only when NODE_USE_ENV_PROXY=1 is present at startup, and a
+ *  packaged app inherits whatever the OS shell had — usually nothing. This
+ *  turns one explicit setting (LH_PROXY_URL, or an already-exported
+ *  HTTPS_PROXY/https_proxy) into the full set the child needs, so every
+ *  provider (OpenAI, Anthropic, Google) leaves through the same proxy.
+ *  Node's built-in fetch ignores all_proxy=socks5; point LH_PROXY_URL at an
+ *  HTTP/mixed proxy port.
+ *
+ *  This build defaults to the local mixed proxy below so the packaged app
+ *  works without any environment setup; LH_PROXY_URL=off disables it. */
+const DEFAULT_MODEL_PROXY = "http://127.0.0.1:17891";
+
+function proxyEnv() {
+	const explicit = process.env.LH_PROXY_URL;
+	const url = explicit === "off"
+		? ""
+		: explicit || process.env.HTTPS_PROXY || process.env.https_proxy || DEFAULT_MODEL_PROXY;
+	if (!url) return {};
+	// Keep loopback direct: the backend talks to itself and to local tools.
+	const noProxy = [process.env.NO_PROXY, process.env.no_proxy, "localhost,127.0.0.1,::1"]
+		.filter(Boolean)
+		.join(",");
+	return {
+		NODE_USE_ENV_PROXY: "1",
+		HTTP_PROXY: url,
+		HTTPS_PROXY: url,
+		http_proxy: url,
+		https_proxy: url,
+		NO_PROXY: noProxy,
+		no_proxy: noProxy,
+	};
+}
+
 function startServer(port) {
 	return new Promise((resolve, reject) => {
+		// Desktop model calls leave through the same proxy as the app.
+		const proxy = proxyEnv();
+		if (proxy.HTTPS_PROXY) log(`server proxy: model requests via ${proxy.HTTPS_PROXY}`);
 		const child = spawn(
 			process.execPath,
 			// Only the macOS backend needs this: Next's native title setter
@@ -224,6 +263,7 @@ function startServer(port) {
 				cwd: path.dirname(serverEntry()),
 				env: {
 					...process.env,
+					...proxy,
 					ELECTRON_RUN_AS_NODE: "1",
 					NODE_ENV: "production",
 					PORT: String(port),
